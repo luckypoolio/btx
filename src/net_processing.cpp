@@ -251,10 +251,8 @@ static constexpr uint64_t MATMUL_RC_ADMISSION_MAX_GRIND_TRIES{4'000'000};
  * independently from the verification/admission stores. */
 static constexpr size_t MATMUL_RC_RELAY_OBSERVATIONS_MAX{128};
 static constexpr auto MATMUL_RC_RELAY_OBSERVATION_TTL{10min};
-/** Synthetic peer key for a node-wide RC verification-budget cooldown. Node
- * IDs are non-negative, so it cannot collide with an actual source. */
-static constexpr int64_t MATMUL_RC_GLOBAL_BUDGET_COOLDOWN_PEER{
-    std::numeric_limits<int64_t>::min()};
+/** One full RC replay consumes the node-wide one-minute work allowance. */
+static constexpr auto MATMUL_RC_GLOBAL_BUDGET_COOLDOWN{60s};
 /** Average delay between feefilter broadcasts in seconds. */
 static constexpr auto AVG_FEEFILTER_BROADCAST_INTERVAL{10min};
 /** Maximum feefilter broadcast delay after significant change. */
@@ -1230,12 +1228,15 @@ private:
      *  node-wide or source-specific verification token bucket. */
     mutable node::RCDeferredBodyCooldowns m_matmul_rc_budget_deferred_bodies
         GUARDED_BY(m_matmul_rc_deferred_mutex);
+    std::chrono::steady_clock::time_point m_matmul_rc_global_budget_deferred_until
+        GUARDED_BY(m_matmul_rc_deferred_mutex){};
     void MarkMatMulRCBodyDeferred(const uint256& hash, int64_t peer_id) NO_THREAD_SAFETY_ANALYSIS;
     bool IsMatMulRCBodyDeferred(const uint256& hash, int64_t peer_id) const NO_THREAD_SAFETY_ANALYSIS;
     void ClearMatMulRCBodyDeferred(const uint256& hash) NO_THREAD_SAFETY_ANALYSIS;
     void MarkMatMulRCBudgetDeferred(const uint256& hash, int64_t peer_id, bool global) NO_THREAD_SAFETY_ANALYSIS;
     bool IsMatMulRCBudgetDeferred(const uint256& hash, int64_t peer_id) const NO_THREAD_SAFETY_ANALYSIS;
     void ClearMatMulRCBudgetDeferred(const uint256& hash) NO_THREAD_SAFETY_ANALYSIS;
+    void CloseMatMulRCGlobalBudgetWindow() NO_THREAD_SAFETY_ANALYSIS;
     void PinMatMulBlockSource(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     void UnpinMatMulBlockSource(const uint256& hash) NO_THREAD_SAFETY_ANALYSIS;
     void EraseMatMulBlockSourceIfUnpinned(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
@@ -1915,11 +1916,13 @@ void PeerManagerImpl::ClearMatMulRCBodyDeferred(const uint256& hash)
 void PeerManagerImpl::MarkMatMulRCBudgetDeferred(
     const uint256& hash, int64_t peer_id, bool global)
 {
+    if (global) {
+        CloseMatMulRCGlobalBudgetWindow();
+        return;
+    }
     LOCK(m_matmul_rc_deferred_mutex);
     (void)m_matmul_rc_budget_deferred_bodies.Mark(
-        hash,
-        global ? MATMUL_RC_GLOBAL_BUDGET_COOLDOWN_PEER : peer_id,
-        std::chrono::steady_clock::now());
+        hash, peer_id, std::chrono::steady_clock::now());
 }
 
 bool PeerManagerImpl::IsMatMulRCBudgetDeferred(
@@ -1927,8 +1930,7 @@ bool PeerManagerImpl::IsMatMulRCBudgetDeferred(
 {
     LOCK(m_matmul_rc_deferred_mutex);
     const auto now{std::chrono::steady_clock::now()};
-    return m_matmul_rc_budget_deferred_bodies.Contains(
-               hash, MATMUL_RC_GLOBAL_BUDGET_COOLDOWN_PEER, now) ||
+    return now < m_matmul_rc_global_budget_deferred_until ||
         m_matmul_rc_budget_deferred_bodies.Contains(hash, peer_id, now);
 }
 
@@ -1936,6 +1938,16 @@ void PeerManagerImpl::ClearMatMulRCBudgetDeferred(const uint256& hash)
 {
     LOCK(m_matmul_rc_deferred_mutex);
     m_matmul_rc_budget_deferred_bodies.Erase(hash);
+}
+
+void PeerManagerImpl::CloseMatMulRCGlobalBudgetWindow()
+{
+    LOCK(m_matmul_rc_deferred_mutex);
+    const auto now{std::chrono::steady_clock::now()};
+    if (now >= m_matmul_rc_global_budget_deferred_until) {
+        m_matmul_rc_global_budget_deferred_until =
+            now + MATMUL_RC_GLOBAL_BUDGET_COOLDOWN;
+    }
 }
 
 void PeerManagerImpl::PinMatMulBlockSource(const uint256& hash)
@@ -5424,6 +5436,8 @@ void PeerManagerImpl::MaybeStartMatMulRCHeaderVerification(
                 1, std::memory_order_relaxed);
             if (!global_exhausted) {
                 node.fDisconnect = true;
+            } else {
+                CloseMatMulRCGlobalBudgetWindow();
             }
             LogDebug(
                 BCLog::NET,
@@ -5538,6 +5552,10 @@ void PeerManagerImpl::MaybeStartMatMulRCHeaderVerification(
         RefundMatMulRCVerificationBudgetForPeer(
             charged_address, charged_netgroup, budget_debit);
         return;
+    }
+
+    if (budget_debit.refundable) {
+        CloseMatMulRCGlobalBudgetWindow();
     }
 
     ClearMatMulRCBodyDeferred(hash);
@@ -6515,6 +6533,9 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
         }
         if (!m_matmul_verify_worker) {
             commit_body_ticket();
+            if (matmul_admission.rc_profile) {
+                CloseMatMulRCGlobalBudgetWindow();
+            }
             ProcessBlockSync(node.GetId(), &node, block, force_processing, min_pow_checked, post_process);
             release_admission_marker();
             return;
@@ -6714,6 +6735,10 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
                             node::MatMulVerifyWorker::
                                 EnqueueResult::Joined) {
                         commit_body_ticket();
+                        if (matmul_admission.rc_profile &&
+                            body_budget_debit.refundable) {
+                            CloseMatMulRCGlobalBudgetWindow();
+                        }
                         return; // message thread freed
                     }
                 }
@@ -11777,6 +11802,9 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
             ShouldSerializeMatMulRCTipDownloads(
                 consensusParams.IsMatMulRCFamilyActive(active_height + 1),
                 active_height, peer_best_height)};
+        const bool rc_verification_pending{
+            m_matmul_rc_pending_verifications.load(
+                std::memory_order_relaxed) > 0};
         const auto is_background_snapshot_block = [snapshot_base](const CBlockIndex* block) {
             return snapshot_base != nullptr && block != nullptr &&
                 block->nHeight <= snapshot_base->nHeight &&
@@ -11866,7 +11894,7 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
             // before the background chainstate to prioritize getting to network tip.
             const unsigned int foreground_budget{MatMulRCTipDownloadBudget(
                 serialize_rc_tip_downloads,
-                serialized_rc_request != nullptr,
+                serialized_rc_request != nullptr || rc_verification_pending,
                 static_cast<unsigned int>(get_inflight_budget()))};
             FindNextBlocksToDownload(*peer, foreground_budget, vToDownload,
                                      staller, pto->HasPermission(NetPermissionFlags::Download));
