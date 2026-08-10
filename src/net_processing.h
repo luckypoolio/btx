@@ -56,8 +56,9 @@ static constexpr uint32_t MAX_MATMUL_RC_TIP_VERIFY_JOBS_PER_MINUTE{16};
 
 /** Whether scarce per-peer block-download capacity may be assigned to the
  * assumeutxo background chain. The active snapshot chain must first be out of
- * IBD and within one block of the best known header; the IBD latch alone can
- * clear based on chainwork and tip age while a fresh snapshot is still behind. */
+ * IBD and caught up to the peer; allowing background work one block early
+ * conflicts with RC foreground serialization, which cancels and immediately
+ * requeues those historical requests. */
 constexpr bool ShouldFetchBackgroundSnapshotBlocks(
     bool background_sync,
     bool limited_peer,
@@ -66,7 +67,7 @@ constexpr bool ShouldFetchBackgroundSnapshotBlocks(
     int best_header_height)
 {
     return background_sync && !limited_peer && !initial_block_download &&
-        best_header_height >= 0 && active_height >= best_header_height - 1;
+        best_header_height >= 0 && active_height >= best_header_height;
 }
 
 /** Whether already queued background downloads should yield to the active

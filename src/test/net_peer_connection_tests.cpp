@@ -188,7 +188,7 @@ BOOST_AUTO_TEST_CASE(snapshot_background_download_waits_for_tip_catchup)
         /*background_sync=*/true, /*limited_peer=*/false,
         /*initial_block_download=*/false, /*active_height=*/150,
         /*best_header_height=*/200));
-    BOOST_CHECK(ShouldFetchBackgroundSnapshotBlocks(
+    BOOST_CHECK(!ShouldFetchBackgroundSnapshotBlocks(
         /*background_sync=*/true, /*limited_peer=*/false,
         /*initial_block_download=*/false, /*active_height=*/199,
         /*best_header_height=*/200));
