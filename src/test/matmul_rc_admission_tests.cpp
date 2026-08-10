@@ -144,6 +144,24 @@ BOOST_AUTO_TEST_CASE(deferred_body_cooldown_is_bounded_and_explicitly_clearable)
     BOOST_CHECK_EQUAL(cooldowns.Size(start + std::chrono::seconds{2}), 0U);
 }
 
+BOOST_AUTO_TEST_CASE(admission_clear_does_not_clear_budget_cooldown)
+{
+    node::RCDeferredBodyCooldowns admission;
+    node::RCDeferredBodyCooldowns budget;
+    const auto start{std::chrono::steady_clock::time_point{
+        std::chrono::seconds{3'000}}};
+    const uint256 hash{1};
+
+    BOOST_REQUIRE(admission.Mark(hash, /*peer_id=*/7, start));
+    BOOST_REQUIRE(budget.Mark(hash, /*global_budget_key=*/-1, start));
+
+    // Receiving a valid sidecar resolves only admission. The independent
+    // global budget window must continue to suppress immediate body retries.
+    admission.Erase(hash);
+    BOOST_CHECK(!admission.Contains(hash, /*peer_id=*/7, start));
+    BOOST_CHECK(budget.Contains(hash, /*global_budget_key=*/-1, start));
+}
+
 BOOST_AUTO_TEST_CASE(ticket_is_sidecar_bound_and_grindable)
 {
     const CBlockHeader header{Header()};

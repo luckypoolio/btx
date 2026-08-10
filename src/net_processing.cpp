@@ -251,6 +251,10 @@ static constexpr uint64_t MATMUL_RC_ADMISSION_MAX_GRIND_TRIES{4'000'000};
  * independently from the verification/admission stores. */
 static constexpr size_t MATMUL_RC_RELAY_OBSERVATIONS_MAX{128};
 static constexpr auto MATMUL_RC_RELAY_OBSERVATION_TTL{10min};
+/** Synthetic peer key for a node-wide RC verification-budget cooldown. Node
+ * IDs are non-negative, so it cannot collide with an actual source. */
+static constexpr int64_t MATMUL_RC_GLOBAL_BUDGET_COOLDOWN_PEER{
+    std::numeric_limits<int64_t>::min()};
 /** Average delay between feefilter broadcasts in seconds. */
 static constexpr auto AVG_FEEFILTER_BROADCAST_INTERVAL{10min};
 /** Maximum feefilter broadcast delay after significant change. */
@@ -1221,9 +1225,17 @@ private:
     mutable Mutex m_matmul_rc_deferred_mutex;
     mutable node::RCDeferredBodyCooldowns m_matmul_rc_deferred_bodies
         GUARDED_BY(m_matmul_rc_deferred_mutex);
+    /** Budget deferrals are separate from admission-sidecar deferrals. A valid
+     *  rcadmit may make a ticketless body useful, but cannot refill either the
+     *  node-wide or source-specific verification token bucket. */
+    mutable node::RCDeferredBodyCooldowns m_matmul_rc_budget_deferred_bodies
+        GUARDED_BY(m_matmul_rc_deferred_mutex);
     void MarkMatMulRCBodyDeferred(const uint256& hash, int64_t peer_id) NO_THREAD_SAFETY_ANALYSIS;
     bool IsMatMulRCBodyDeferred(const uint256& hash, int64_t peer_id) const NO_THREAD_SAFETY_ANALYSIS;
     void ClearMatMulRCBodyDeferred(const uint256& hash) NO_THREAD_SAFETY_ANALYSIS;
+    void MarkMatMulRCBudgetDeferred(const uint256& hash, int64_t peer_id, bool global) NO_THREAD_SAFETY_ANALYSIS;
+    bool IsMatMulRCBudgetDeferred(const uint256& hash, int64_t peer_id) const NO_THREAD_SAFETY_ANALYSIS;
+    void ClearMatMulRCBudgetDeferred(const uint256& hash) NO_THREAD_SAFETY_ANALYSIS;
     void PinMatMulBlockSource(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     void UnpinMatMulBlockSource(const uint256& hash) NO_THREAD_SAFETY_ANALYSIS;
     void EraseMatMulBlockSourceIfUnpinned(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
@@ -1900,6 +1912,32 @@ void PeerManagerImpl::ClearMatMulRCBodyDeferred(const uint256& hash)
     m_matmul_rc_deferred_bodies.Erase(hash);
 }
 
+void PeerManagerImpl::MarkMatMulRCBudgetDeferred(
+    const uint256& hash, int64_t peer_id, bool global)
+{
+    LOCK(m_matmul_rc_deferred_mutex);
+    (void)m_matmul_rc_budget_deferred_bodies.Mark(
+        hash,
+        global ? MATMUL_RC_GLOBAL_BUDGET_COOLDOWN_PEER : peer_id,
+        std::chrono::steady_clock::now());
+}
+
+bool PeerManagerImpl::IsMatMulRCBudgetDeferred(
+    const uint256& hash, int64_t peer_id) const
+{
+    LOCK(m_matmul_rc_deferred_mutex);
+    const auto now{std::chrono::steady_clock::now()};
+    return m_matmul_rc_budget_deferred_bodies.Contains(
+               hash, MATMUL_RC_GLOBAL_BUDGET_COOLDOWN_PEER, now) ||
+        m_matmul_rc_budget_deferred_bodies.Contains(hash, peer_id, now);
+}
+
+void PeerManagerImpl::ClearMatMulRCBudgetDeferred(const uint256& hash)
+{
+    LOCK(m_matmul_rc_deferred_mutex);
+    m_matmul_rc_budget_deferred_bodies.Erase(hash);
+}
+
 void PeerManagerImpl::PinMatMulBlockSource(const uint256& hash)
 {
     AssertLockHeld(cs_main);
@@ -2321,6 +2359,9 @@ void PeerManagerImpl::FindNextBlocks(std::vector<const CBlockIndex*>& vBlocks, c
             // peer so an unsolicited ticketless body from one source cannot
             // suppress the block from every other source.
             if (IsMatMulRCBodyDeferred(pindex->GetBlockHash(), peer.m_id)) {
+                continue;
+            }
+            if (IsMatMulRCBudgetDeferred(pindex->GetBlockHash(), peer.m_id)) {
                 continue;
             }
 
@@ -6360,6 +6401,7 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
                 matmul_admission.reference_height, global_exhausted,
                 matmul_admission.rc_profile)) {
             if (matmul_admission.rc_profile) {
+                ClearMatMulRCBudgetDeferred(hash);
                 body_budget_debit = {
                     .verification_count = matmul_admission.work_units,
                     .charged_at = charged_at,
@@ -6389,9 +6431,12 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
         }
         if (matmul_admission.rc_profile) {
             // Receipt already removed the ordinary in-flight marker. Keep the
-            // same source from immediately redelivering this body on every
-            // message-handler pass while the one-minute RC window is closed.
-            MarkMatMulRCBodyDeferred(hash, node.GetId());
+            // same source from immediately redelivering this body on a
+            // per-peer miss, or every source on a global miss, while the
+            // one-minute RC window is closed. This state must not be cleared
+            // by a valid admission sidecar.
+            MarkMatMulRCBudgetDeferred(
+                hash, node.GetId(), global_exhausted);
         }
         return false;
     };
@@ -7107,6 +7152,7 @@ void PeerManagerImpl::ProcessBlockSync(NodeId nodeid, CNode* node, const std::sh
     // index is permanently failed, or its TTL expires.
     if (exact_replay_authenticated || terminal_failure) {
         ClearMatMulRCBodyDeferred(block->GetHash());
+        ClearMatMulRCBudgetDeferred(block->GetHash());
         FinishMatMulAuthenticatedRelayObservation(
             block->GetHash(), exact_replay_authenticated);
     }
