@@ -2,7 +2,7 @@
 # Copyright (c) 2026 The BTX developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or https://opensource.org/license/mit/.
-"""Prevent provisional RC relay from stranding the block body.
+"""Prevent provisional RC relay and catch-up from stranding block bodies.
 
 Topology is 0--1--2.  Node 1 provisionally relays a paid direct-tip RC header
 to high-bandwidth peer 2 while its own ExactReplay is still running.  Node 2
@@ -12,7 +12,9 @@ the already-known header and leave node 2's first request stuck until timeout.
 The test runs both payload-bearing full-block relay and ordinary compact-block
 relay, and sends more blocks than the unknown-ticket per-netgroup allowance in
 each mode to prove outbound ordering does not misclassify honest tickets as
-unknown.
+unknown. It then reconnects a node several blocks behind and proves headers
+direct-fetch keeps exactly one requested body in the single-flight RC lane;
+descendant bodies must not arrive untracked and enter the retry cooldown.
 """
 
 from contextlib import ExitStack
@@ -107,6 +109,35 @@ class MatMulProvisionalBodyRelayTest(BitcoinTestFramework):
         assert node0.getconnectioncount() > 0
         assert node1.getconnectioncount() > 0
         assert node2.getconnectioncount() > 0
+
+        # Reproduce production catch-up: a peer reconnects after several RC
+        # blocks and receives them in one headers response. Direct fetch must
+        # request one body at a time, otherwise SendMessages drops the later
+        # in-flight markers while their already-sent bodies are still arriving.
+        self.disconnect_nodes(1, 2)
+        catchup_burst = 6
+        self.generate(node0, catchup_burst, sync_fun=self.no_op)
+        self.wait_until(
+            lambda: node1.getblockcount() == RC_HEIGHT - 1 + rc_burst + catchup_burst,
+            timeout=120,
+        )
+        assert_equal(node2.getblockcount(), RC_HEIGHT - 1 + rc_burst)
+
+        with node2.assert_debug_log(
+            expected_msgs=[],
+            unexpected_msgs=[
+                "lower-priority block requests",
+                "RC ExactReplay requires rcadmit",
+            ],
+            timeout=120,
+        ):
+            self.connect_nodes(1, 2)
+            expected = node1.getbestblockhash()
+            self.wait_until(
+                lambda: node2.getblockcount() == node1.getblockcount()
+                and node2.getbestblockhash() == expected,
+                timeout=120,
+            )
 
 
 if __name__ == "__main__":

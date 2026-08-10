@@ -4882,6 +4882,22 @@ void PeerManagerImpl::HeadersDirectFetchBlocks(CNode& pfrom, const Peer& peer, c
         return;
     }
 
+    const int active_height{m_chainman.ActiveHeight()};
+    const bool serialize_rc_tip_downloads{
+        ShouldSerializeMatMulRCTipDownloads(
+            m_chainparams.GetConsensus().IsMatMulRCFamilyActive(
+                active_height + 1),
+            active_height, last_header.nHeight)};
+    const bool rc_lane_busy{
+        serialize_rc_tip_downloads &&
+        (!mapBlocksInFlight.empty() ||
+         m_matmul_rc_pending_verifications.load(
+             std::memory_order_relaxed) > 0)};
+    const unsigned int direct_fetch_budget{MatMulRCTipDownloadBudget(
+        serialize_rc_tip_downloads, rc_lane_busy,
+        MAX_BLOCKS_IN_TRANSIT_PER_PEER)};
+    if (direct_fetch_budget == 0) return;
+
     // WP-8 site 1: gate the direct fetch on TRUST-ADJUSTED work (== nChainWork
     // pre-fork). Honest announcements extend our validated tip and pass
     // immediately; a forged deep high-work fork is clamped and falls back to
@@ -4908,6 +4924,17 @@ void PeerManagerImpl::HeadersDirectFetchBlocks(CNode& pfrom, const Peer& peer, c
                      last_header.GetBlockHash().ToString(),
                      last_header.nHeight);
         } else {
+            // RC ExactReplay is single-flight. Requesting every descendant in
+            // this headers batch makes SendMessages release all but the first
+            // in-flight marker; the peer can still deliver those already-sent
+            // bodies, which then look unsolicited, require rcadmit, and enter a
+            // 60-second retry cooldown. Keep only the earliest useful body and
+            // let each successful replay open the next download slot.
+            if (vToFetch.size() > direct_fetch_budget) {
+                vToFetch.erase(
+                    vToFetch.begin(),
+                    vToFetch.end() - direct_fetch_budget);
+            }
             std::vector<CInv> vGetData;
             // Download as much as possible, from earliest to latest.
             for (const CBlockIndex* pindex : vToFetch | std::views::reverse) {
