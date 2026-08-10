@@ -94,9 +94,9 @@ constexpr unsigned int BackgroundSnapshotDownloadBudget(
 }
 
 /** RC ExactReplay is intentionally single-flight and rate limited. While the
- * authenticated active chain is behind a peer, downloading descendants before
- * the direct tip child only lets out-of-order bodies consume scarce admission
- * opportunities and creates a getdata/body retry loop. */
+ * authenticated active chain is behind a peer, download only the first missing
+ * block on one peer branch. That block may be at or below the active height
+ * when a competing branch must be downloaded from its fork point. */
 constexpr bool ShouldSerializeMatMulRCTipDownloads(
     bool rc_family_active,
     int active_height,
@@ -106,12 +106,13 @@ constexpr bool ShouldSerializeMatMulRCTipDownloads(
         peer_best_height > active_height;
 }
 
-constexpr bool IsNextMatMulRCTipBlock(
+constexpr unsigned int MatMulRCTipDownloadBudget(
     bool serialize_tip_downloads,
-    int active_height,
-    int block_height)
+    bool request_in_flight,
+    unsigned int available_slots)
 {
-    return !serialize_tip_downloads || block_height == active_height + 1;
+    if (!serialize_tip_downloads) return available_slots;
+    return request_in_flight || available_slots == 0 ? 0U : 1U;
 }
 
 /** Whether a connected peer remains eligible for block/header synchronization

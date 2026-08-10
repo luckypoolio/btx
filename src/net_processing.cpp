@@ -11782,11 +11782,44 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                 block->nHeight <= snapshot_base->nHeight &&
                 snapshot_base->GetAncestor(block->nHeight) == block;
         };
+        const CBlockIndex* serialized_rc_request{nullptr};
+        NodeId serialized_rc_peer{-1};
+        if (serialize_rc_tip_downloads) {
+            // Keep only the earliest useful foreground request globally. The
+            // peer's first missing block can be a competing block at the
+            // active height after a fork; selecting by earliest height, rather
+            // than active_height + 1, lets that reorg path begin.
+            for (const auto& entry : mapBlocksInFlight) {
+                const auto& request{entry.second};
+                const auto& [request_peer, request_it] = request;
+                const CBlockIndex* requested{request_it->pindex};
+                if (requested == nullptr ||
+                    is_background_snapshot_block(requested)) {
+                    continue;
+                }
+                const CNodeState* request_state{State(request_peer)};
+                const CBlockIndex* request_best{
+                    request_state != nullptr
+                        ? request_state->pindexBestKnownBlock
+                        : nullptr};
+                if (request_best == nullptr ||
+                    requested->nHeight > request_best->nHeight ||
+                    request_best->GetAncestor(requested->nHeight) != requested) {
+                    continue;
+                }
+                if (serialized_rc_request == nullptr ||
+                    requested->nHeight < serialized_rc_request->nHeight) {
+                    serialized_rc_request = requested;
+                    serialized_rc_peer = request_peer;
+                }
+            }
+        }
 
         // Requests queued while the snapshot chain was at tip can otherwise
         // occupy every slot after a new V4 header arrives. Historical snapshot
-        // requests yield to foreground sync; under single-flight RC, descendants
-        // also yield to the direct active-tip child. All remain re-requestable.
+        // requests yield to foreground sync; under single-flight RC, all but
+        // the earliest useful peer-branch request yield too. All remain
+        // re-requestable.
         if ((snapshot_base != nullptr && ShouldPrioritizeActiveSnapshotChain(
                  background_sync, active_height, peer_best_height)) ||
             serialize_rc_tip_downloads) {
@@ -11796,7 +11829,8 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                     is_background_snapshot_block(queued.pindex)};
                 const bool rc_descendant_request{
                     queued.pindex != nullptr && serialize_rc_tip_downloads &&
-                    queued.pindex->nHeight > active_height + 1};
+                    (queued.pindex != serialized_rc_request ||
+                     pto->GetId() != serialized_rc_peer)};
                 if (background_request || rc_descendant_request) {
                     lower_priority_requests.push_back(
                         queued.pindex->GetBlockHash());
@@ -11830,21 +11864,12 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
 
             // If a snapshot chainstate is in use, we want to find its next blocks
             // before the background chainstate to prioritize getting to network tip.
-            FindNextBlocksToDownload(*peer, get_inflight_budget(), vToDownload,
+            const unsigned int foreground_budget{MatMulRCTipDownloadBudget(
+                serialize_rc_tip_downloads,
+                serialized_rc_request != nullptr,
+                static_cast<unsigned int>(get_inflight_budget()))};
+            FindNextBlocksToDownload(*peer, foreground_budget, vToDownload,
                                      staller, pto->HasPermission(NetPermissionFlags::Download));
-            if (serialize_rc_tip_downloads) {
-                std::erase_if(
-                    vToDownload,
-                    [active_height](const CBlockIndex* block) {
-                        return block == nullptr ||
-                            !IsNextMatMulRCTipBlock(
-                                /*serialize_tip_downloads=*/true,
-                                active_height, block->nHeight);
-                    });
-                if (vToDownload.size() > 1) {
-                    vToDownload.resize(1);
-                }
-            }
             // Defer genesis→snapshot historical downloads while the active
             // (snapshot) chain is still catching up to network tip. Sharing the
             // per-peer inflight budget with background IBD starves tip catch-up

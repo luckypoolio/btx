@@ -232,15 +232,15 @@ BOOST_AUTO_TEST_CASE(snapshot_background_download_waits_for_tip_catchup)
     BOOST_CHECK(!ShouldSerializeMatMulRCTipDownloads(
         /*rc_family_active=*/true, /*active_height=*/185291,
         /*peer_best_height=*/185291));
-    BOOST_CHECK(IsNextMatMulRCTipBlock(
-        /*serialize_tip_downloads=*/true, /*active_height=*/185270,
-        /*block_height=*/185271));
-    BOOST_CHECK(!IsNextMatMulRCTipBlock(
-        /*serialize_tip_downloads=*/true, /*active_height=*/185270,
-        /*block_height=*/185272));
-    BOOST_CHECK(IsNextMatMulRCTipBlock(
-        /*serialize_tip_downloads=*/false, /*active_height=*/185270,
-        /*block_height=*/185272));
+    BOOST_CHECK_EQUAL(MatMulRCTipDownloadBudget(
+        /*serialize_tip_downloads=*/true, /*request_in_flight=*/false,
+        /*available_slots=*/16), 1U);
+    BOOST_CHECK_EQUAL(MatMulRCTipDownloadBudget(
+        /*serialize_tip_downloads=*/true, /*request_in_flight=*/true,
+        /*available_slots=*/16), 0U);
+    BOOST_CHECK_EQUAL(MatMulRCTipDownloadBudget(
+        /*serialize_tip_downloads=*/false, /*request_in_flight=*/true,
+        /*available_slots=*/16), 16U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
