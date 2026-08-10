@@ -13,6 +13,7 @@
 #include <validationinterface.h>
 
 #include <chrono>
+#include <limits>
 
 class AddrMan;
 class CChainParams;
@@ -48,6 +49,10 @@ static constexpr size_t MAX_SHIELDED_TX_RELAY_BYTES_PER_SECOND{500'000};
 static constexpr size_t MAX_SHIELDEDDATA_REQUESTS_PER_SECOND{8};
 /** Keep most per-peer download capacity available for new active-chain blocks. */
 static constexpr unsigned int MAX_BACKGROUND_SNAPSHOT_BLOCKS_IN_TRANSIT_PER_PEER{2};
+/** Requested direct children of the authenticated tip may use a larger, still
+ * bounded RC replay budget so a validating node can recover after downtime. */
+static constexpr uint32_t DEFAULT_MATMUL_RC_TIP_VERIFY_JOBS_PER_MINUTE{4};
+static constexpr uint32_t MAX_MATMUL_RC_TIP_VERIFY_JOBS_PER_MINUTE{16};
 
 /** Whether scarce per-peer block-download capacity may be assigned to the
  * assumeutxo background chain. The active snapshot chain must first be out of
@@ -113,6 +118,37 @@ constexpr unsigned int MatMulRCTipDownloadBudget(
 {
     if (!serialize_tip_downloads) return available_slots;
     return request_in_flight || available_slots == 0 ? 0U : 1U;
+}
+
+/** Convert complete RC jobs/minute into the work-unit accounting used by the
+ * replay admission buckets, saturating on operator-supplied values. */
+constexpr uint32_t MatMulRCTipVerifyBudgetWorkUnits(
+    uint32_t work_units_per_job,
+    uint32_t jobs_per_minute)
+{
+    if (work_units_per_job == 0 || jobs_per_minute == 0) return 0;
+    if (jobs_per_minute >
+        std::numeric_limits<uint32_t>::max() / work_units_per_job) {
+        return std::numeric_limits<uint32_t>::max();
+    }
+    return work_units_per_job * jobs_per_minute;
+}
+
+/** The accelerated budget is intentionally narrow: a peer must be eligible
+ * for RC consensus sync and the work must extend the authenticated active tip
+ * toward a strictly higher peer tip. Callers separately require either a
+ * requested body or a paid header-first admission ticket. */
+constexpr bool UseMatMulRCTipCatchUpBudget(
+    bool requested_or_admitted,
+    bool direct_authenticated_tip_child,
+    bool peer_is_eligible,
+    int active_height,
+    int peer_best_height,
+    uint32_t jobs_per_minute)
+{
+    return jobs_per_minute > 0 && requested_or_admitted &&
+        direct_authenticated_tip_child && peer_is_eligible &&
+        active_height >= 0 && peer_best_height > active_height;
 }
 
 /** Whether a connected peer remains eligible for block/header synchronization
@@ -248,6 +284,11 @@ public:
         //! Relay at most a small authenticated-tip-child candidate set while
         //! ExactReplay is pending; never grants chainwork or mining eligibility.
         bool matmul_rc_provisional_relay{true};
+        //! Complete RC replay jobs admitted per minute for requested or paid
+        //! direct children while the authenticated active tip trails a
+        //! consensus-capable peer. Replay remains single-flight.
+        uint32_t matmul_rc_tip_verify_jobs_per_minute{
+            DEFAULT_MATMUL_RC_TIP_VERIFY_JOBS_PER_MINUTE};
     };
 
     static std::unique_ptr<PeerManager> make(CConnman& connman, AddrMan& addrman,

@@ -674,7 +674,8 @@ bool ConsumeMatMulRCPeerVerifyBudget(
     const Consensus::Params& params,
     std::chrono::steady_clock::time_point now,
     bool is_ibd = false,
-    int32_t reference_height = std::numeric_limits<int32_t>::max());
+    int32_t reference_height = std::numeric_limits<int32_t>::max(),
+    uint32_t effective_budget_override = 0);
 /** Atomically debit both reconnect-resistant RC source dimensions. A failure
  *  restores both budgets to their exact pre-attempt windows and counts. */
 bool ConsumeMatMulRCSourceVerifyBudgets(
@@ -684,7 +685,8 @@ bool ConsumeMatMulRCSourceVerifyBudgets(
     uint32_t verification_count,
     std::chrono::steady_clock::time_point now,
     bool is_ibd = false,
-    int32_t reference_height = std::numeric_limits<int32_t>::max());
+    int32_t reference_height = std::numeric_limits<int32_t>::max(),
+    uint32_t effective_budget_override = 0);
 /** Refund one source counter only when charged_at still belongs to its current
  *  window. Used solely for admission/enqueue rollback before work starts. */
 void RefundMatMulRCPeerVerifyBudget(

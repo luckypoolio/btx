@@ -5396,15 +5396,18 @@ uint32_t EffectiveMatMulRCPeerVerifyBudgetPerMin(const Consensus::Params& params
 bool ConsumeMatMulRCPeerVerifyBudget(MatMulPeerVerificationBudget& budget,
                                      const Consensus::Params& params,
                                      std::chrono::steady_clock::time_point now, bool is_ibd,
-                                     int32_t reference_height)
+                                     int32_t reference_height,
+                                     uint32_t effective_budget_override)
 {
     if (budget.rc_window_start == std::chrono::steady_clock::time_point{} ||
         now - budget.rc_window_start >= std::chrono::minutes{1}) {
         budget.rc_window_start = now;
         budget.expensive_rc_verifications_this_minute = 0;
     }
-    const uint32_t effective_budget =
-        EffectiveMatMulRCPeerVerifyBudgetPerMin(params, is_ibd, reference_height);
+    const uint32_t effective_budget = effective_budget_override != 0
+        ? effective_budget_override
+        : EffectiveMatMulRCPeerVerifyBudgetPerMin(
+              params, is_ibd, reference_height);
     if (effective_budget == 0) return false;
     if (budget.expensive_rc_verifications_this_minute >= effective_budget) {
         return false;
@@ -5420,7 +5423,8 @@ bool ConsumeMatMulRCSourceVerifyBudgets(
     uint32_t verification_count,
     std::chrono::steady_clock::time_point now,
     bool is_ibd,
-    int32_t reference_height)
+    int32_t reference_height,
+    uint32_t effective_budget_override)
 {
     const auto saved_address_window{address_budget.rc_window_start};
     const uint32_t saved_address_count{
@@ -5439,10 +5443,11 @@ bool ConsumeMatMulRCSourceVerifyBudgets(
     };
     for (uint32_t i = 0; i < verification_count; ++i) {
         if (!ConsumeMatMulRCPeerVerifyBudget(
-                address_budget, params, now, is_ibd, reference_height) ||
+                address_budget, params, now, is_ibd, reference_height,
+                effective_budget_override) ||
             !ConsumeMatMulRCPeerVerifyBudget(
                 keyed_netgroup_budget, params, now, is_ibd,
-                reference_height)) {
+                reference_height, effective_budget_override)) {
             restore();
             return false;
         }

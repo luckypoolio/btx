@@ -241,6 +241,45 @@ BOOST_AUTO_TEST_CASE(snapshot_background_download_waits_for_tip_catchup)
     BOOST_CHECK_EQUAL(MatMulRCTipDownloadBudget(
         /*serialize_tip_downloads=*/false, /*request_in_flight=*/true,
         /*available_slots=*/16), 16U);
+
+    BOOST_CHECK_EQUAL(MatMulRCTipVerifyBudgetWorkUnits(
+        /*work_units_per_job=*/129, /*jobs_per_minute=*/4), 516U);
+    BOOST_CHECK_EQUAL(MatMulRCTipVerifyBudgetWorkUnits(
+        /*work_units_per_job=*/129, /*jobs_per_minute=*/0), 0U);
+    BOOST_CHECK_EQUAL(MatMulRCTipVerifyBudgetWorkUnits(
+        std::numeric_limits<uint32_t>::max(), /*jobs_per_minute=*/2),
+        std::numeric_limits<uint32_t>::max());
+
+    BOOST_CHECK(UseMatMulRCTipCatchUpBudget(
+        /*requested_or_admitted=*/true,
+        /*direct_authenticated_tip_child=*/true,
+        /*peer_is_eligible=*/true,
+        /*active_height=*/185317, /*peer_best_height=*/185336,
+        /*jobs_per_minute=*/4));
+    BOOST_CHECK(!UseMatMulRCTipCatchUpBudget(
+        /*requested_or_admitted=*/false,
+        /*direct_authenticated_tip_child=*/true,
+        /*peer_is_eligible=*/true,
+        /*active_height=*/185317, /*peer_best_height=*/185336,
+        /*jobs_per_minute=*/4));
+    BOOST_CHECK(!UseMatMulRCTipCatchUpBudget(
+        /*requested_or_admitted=*/true,
+        /*direct_authenticated_tip_child=*/false,
+        /*peer_is_eligible=*/true,
+        /*active_height=*/185317, /*peer_best_height=*/185336,
+        /*jobs_per_minute=*/4));
+    BOOST_CHECK(!UseMatMulRCTipCatchUpBudget(
+        /*requested_or_admitted=*/true,
+        /*direct_authenticated_tip_child=*/true,
+        /*peer_is_eligible=*/false,
+        /*active_height=*/185317, /*peer_best_height=*/185336,
+        /*jobs_per_minute=*/4));
+    BOOST_CHECK(!UseMatMulRCTipCatchUpBudget(
+        /*requested_or_admitted=*/true,
+        /*direct_authenticated_tip_child=*/true,
+        /*peer_is_eligible=*/true,
+        /*active_height=*/185336, /*peer_best_height=*/185336,
+        /*jobs_per_minute=*/4));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

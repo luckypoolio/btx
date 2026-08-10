@@ -2588,6 +2588,47 @@ BOOST_AUTO_TEST_CASE(rc_replay_budget_survives_address_rotation_within_keyed_net
         /*verification_count=*/1, now, /*is_ibd=*/false, kHeight));
 }
 
+BOOST_AUTO_TEST_CASE(rc_tip_catchup_override_remains_bounded_and_atomic)
+{
+    Consensus::Params p;
+    p.nMatMulV4Height = 1;
+    p.nMatMulRCHeight = 1;
+    p.fMatMulRCUseToyDims = true;
+    p.nMatMulRCPeerVerifyBudgetPerMin = 1;
+    constexpr int32_t kHeight{100};
+    constexpr uint32_t kCatchUpBudget{4};
+
+    MatMulPeerVerificationBudget address_budget;
+    MatMulPeerVerificationBudget netgroup_budget;
+    const auto now{std::chrono::steady_clock::now()};
+
+    for (uint32_t i = 0; i < kCatchUpBudget; ++i) {
+        BOOST_REQUIRE(ConsumeMatMulRCSourceVerifyBudgets(
+            address_budget, netgroup_budget, p,
+            /*verification_count=*/1, now, /*is_ibd=*/false, kHeight,
+            /*effective_budget_override=*/kCatchUpBudget));
+    }
+    BOOST_CHECK_EQUAL(
+        address_budget.expensive_rc_verifications_this_minute,
+        kCatchUpBudget);
+    BOOST_CHECK_EQUAL(
+        netgroup_budget.expensive_rc_verifications_this_minute,
+        kCatchUpBudget);
+
+    // Exhaustion restores both dimensions exactly; neither counter can drift
+    // beyond the explicitly supplied catch-up allowance.
+    BOOST_CHECK(!ConsumeMatMulRCSourceVerifyBudgets(
+        address_budget, netgroup_budget, p,
+        /*verification_count=*/1, now, /*is_ibd=*/false, kHeight,
+        /*effective_budget_override=*/kCatchUpBudget));
+    BOOST_CHECK_EQUAL(
+        address_budget.expensive_rc_verifications_this_minute,
+        kCatchUpBudget);
+    BOOST_CHECK_EQUAL(
+        netgroup_budget.expensive_rc_verifications_this_minute,
+        kCatchUpBudget);
+}
+
 BOOST_AUTO_TEST_CASE(rc_enqueue_refund_receipt_rolls_source_counters_back_once)
 {
     Consensus::Params p;
