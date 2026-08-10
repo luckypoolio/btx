@@ -134,21 +134,39 @@ constexpr uint32_t MatMulRCTipVerifyBudgetWorkUnits(
     return work_units_per_job * jobs_per_minute;
 }
 
-/** The accelerated budget is intentionally narrow: a peer must be eligible
- * for RC consensus sync and the work must extend the authenticated active tip
- * toward a strictly higher peer tip. Callers separately require either a
+/** The accelerated budget is intentionally narrow: the source must pass the
+ * caller's transport policy and the work must extend the authenticated active
+ * tip toward a strictly higher peer tip. Callers separately require either a
  * requested body or a paid header-first admission ticket. */
 constexpr bool UseMatMulRCTipCatchUpBudget(
     bool requested_or_admitted,
     bool direct_authenticated_tip_child,
-    bool peer_is_eligible,
+    bool source_is_eligible,
     int active_height,
     int peer_best_height,
     uint32_t jobs_per_minute)
 {
     return jobs_per_minute > 0 && requested_or_admitted &&
-        direct_authenticated_tip_child && peer_is_eligible &&
+        direct_authenticated_tip_child && source_is_eligible &&
         active_height >= 0 && peer_best_height > active_height;
+}
+
+/** A requested complete body is already bounded by the block-download window
+ * and will be validated locally. It does not become less safe merely because
+ * its transport peer cannot advertise the optional consensus-validator
+ * service bit. Outside IBD, a paid direct-tip header from a block-serving peer
+ * may use the same bounded lane so header-first replay cannot close the body
+ * download window. During IBD, unrequested work still needs a
+ * consensus-tier/NoBan source. */
+constexpr bool IsMatMulRCTipCatchUpSourceEligible(
+    bool consensus_tier_or_noban,
+    bool requested_body,
+    bool can_serve_blocks,
+    bool initial_block_download)
+{
+    return consensus_tier_or_noban ||
+        (can_serve_blocks &&
+         (requested_body || !initial_block_download));
 }
 
 /** Whether a connected peer remains eligible for block/header synchronization
@@ -166,8 +184,9 @@ constexpr bool IsMatMulPeerEligibleForSync(
 }
 
 /** Whether this SendMessages pass may allocate block-download work to a peer.
- * The dynamic MatMul eligibility input is part of both the IBD and near-tip
- * paths, so an ordinary peer cannot bypass the activated tier requirement. */
+ * Initial sync retains the consensus-tier source requirement. Once IBD has
+ * completed, ordinary block-serving peers are valid transport fallbacks: the
+ * local node still performs the exact consensus verification. */
 constexpr bool ShouldRequestBlocksFromMatMulPeer(
     bool can_serve_blocks,
     bool peer_is_eligible,
@@ -178,7 +197,9 @@ constexpr bool ShouldRequestBlocksFromMatMulPeer(
     size_t blocks_in_flight,
     size_t max_blocks_in_flight)
 {
-    return can_serve_blocks && peer_is_eligible && request_window_open &&
+    const bool source_is_eligible{
+        peer_is_eligible || !initial_block_download};
+    return can_serve_blocks && source_is_eligible && request_window_open &&
         ((sync_blocks_and_headers_from_peer && !limited_peer) ||
          !initial_block_download) &&
         blocks_in_flight < max_blocks_in_flight;

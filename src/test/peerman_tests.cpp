@@ -173,11 +173,19 @@ BOOST_AUTO_TEST_CASE(matmul_consensus_tier_sync_eligibility_tracks_activation)
         /*require_matmul_consensus=*/true, base,
         /*has_noban_permission=*/true));
 
-    BOOST_CHECK(!ShouldRequestBlocksFromMatMulPeer(
+    // After IBD, the service bit is advisory. The body is requested through
+    // the bounded download window and receives full local verification.
+    BOOST_CHECK(ShouldRequestBlocksFromMatMulPeer(
         /*can_serve_blocks=*/true, /*peer_is_eligible=*/false,
         /*request_window_open=*/true,
         /*sync_blocks_and_headers_from_peer=*/true,
         /*limited_peer=*/false, /*initial_block_download=*/false,
+        /*blocks_in_flight=*/0, /*max_blocks_in_flight=*/16));
+    BOOST_CHECK(!ShouldRequestBlocksFromMatMulPeer(
+        /*can_serve_blocks=*/true, /*peer_is_eligible=*/false,
+        /*request_window_open=*/true,
+        /*sync_blocks_and_headers_from_peer=*/true,
+        /*limited_peer=*/false, /*initial_block_download=*/true,
         /*blocks_in_flight=*/0, /*max_blocks_in_flight=*/16));
     BOOST_CHECK(ShouldRequestBlocksFromMatMulPeer(
         /*can_serve_blocks=*/true, /*peer_is_eligible=*/true,
@@ -371,17 +379,18 @@ BOOST_AUTO_TEST_CASE(matmul_consensus_tier_connected_peer_loses_preference_at_ac
     BOOST_REQUIRE_EQUAL(consensus_stats.m_total_headers_sync_peer_count, 1);
 
     // Exercise the production SendMessages selection hook. The ordinary peer
-    // loses both VERSION-time preference and header-sync ownership exactly once.
+    // loses VERSION-time preference, but remains a locally verified near-tip
+    // fallback and keeps its already established header stream.
     BOOST_CHECK(peerman.SendMessages(&ordinary_peer));
     BOOST_REQUIRE(peerman.GetNodeStateStats(ordinary_peer.GetId(), ordinary_stats));
     BOOST_REQUIRE(!ordinary_stats.m_preferred_download);
     BOOST_REQUIRE_EQUAL(ordinary_stats.m_total_preferred_download_peer_count, 1);
-    BOOST_REQUIRE(!ordinary_stats.m_headers_sync_started);
-    BOOST_REQUIRE_EQUAL(ordinary_stats.m_total_headers_sync_peer_count, 0);
-    BOOST_REQUIRE(!ordinary_stats.m_chain_sync_protected);
+    BOOST_REQUIRE(ordinary_stats.m_headers_sync_started);
+    BOOST_REQUIRE_EQUAL(ordinary_stats.m_total_headers_sync_peer_count, 1);
+    BOOST_REQUIRE(ordinary_stats.m_chain_sync_protected);
     BOOST_REQUIRE_EQUAL(
-        ordinary_stats.m_total_chain_sync_protected_peer_count, 0);
-    BOOST_REQUIRE(ordinary_peer.fDisconnect);
+        ordinary_stats.m_total_chain_sync_protected_peer_count, 1);
+    BOOST_REQUIRE(!ordinary_peer.fDisconnect);
 
     BOOST_CHECK(peerman.SendMessages(&ordinary_peer));
     BOOST_CHECK(peerman.SendMessages(&consensus_peer));
@@ -391,10 +400,11 @@ BOOST_AUTO_TEST_CASE(matmul_consensus_tier_connected_peer_loses_preference_at_ac
     BOOST_CHECK(consensus_stats.m_preferred_download);
     BOOST_CHECK_EQUAL(ordinary_stats.m_total_preferred_download_peer_count, 1);
     BOOST_CHECK_EQUAL(consensus_stats.m_total_preferred_download_peer_count, 1);
-    BOOST_CHECK(!ordinary_stats.m_headers_sync_started);
-    BOOST_CHECK(consensus_stats.m_headers_sync_started);
+    BOOST_CHECK(ordinary_stats.m_headers_sync_started);
+    BOOST_CHECK(!consensus_stats.m_headers_sync_started);
     BOOST_CHECK_EQUAL(ordinary_stats.m_total_headers_sync_peer_count, 1);
     BOOST_CHECK_EQUAL(consensus_stats.m_total_headers_sync_peer_count, 1);
+    BOOST_CHECK(!ordinary_peer.fDisconnect);
     BOOST_CHECK(!consensus_peer.fDisconnect);
 }
 
@@ -586,13 +596,11 @@ BOOST_AUTO_TEST_CASE(matmul_consensus_tier_compact_block_boundary_policy)
         peerman.GetDesirableServiceFlags(base),
         ServiceFlags(base | NODE_MATMUL_CONSENSUS));
     BOOST_CHECK(peerman.SendMessages(&pre_boundary_peer));
-    BOOST_CHECK(pre_boundary_peer.fDisconnect);
+    BOOST_CHECK(!pre_boundary_peer.fDisconnect);
 
-    // After the local authenticated tip is RC-active, the same class of peer
-    // may still relay a header but must not allocate any compact/full block
-    // download state. Mine a valid next RC child so success cannot be explained
-    // by malformed-header rejection; the header must enter the block index while
-    // its body remains unrequested.
+    // After the local authenticated tip is RC-active, an unsolicited compact
+    // block from the same class of peer remains header-only. Its complete body
+    // is eligible only when the bounded near-tip download loop requests it.
     const CBlockIndex* rc_tip{
         WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip())};
     BOOST_REQUIRE(rc_tip != nullptr);

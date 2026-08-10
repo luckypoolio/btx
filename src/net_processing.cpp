@@ -5306,9 +5306,13 @@ void PeerManagerImpl::MaybeStartMatMulRCHeaderVerification(
             /*require_matmul_consensus=*/true,
             peer.m_their_services.load(),
             node.HasPermission(NetPermissionFlags::NoBan))};
+        const bool catchup_source_is_eligible{
+            IsMatMulRCTipCatchUpSourceEligible(
+                peer_is_eligible, /*requested_body=*/false,
+                CanServeBlocks(peer), is_ibd)};
         use_tip_catchup_budget = UseMatMulRCTipCatchUpBudget(
             /*requested_or_admitted=*/m_opts.matmul_rc_admission,
-            authenticated_tip_child, peer_is_eligible,
+            authenticated_tip_child, catchup_source_is_eligible,
             active_tip->nHeight, peer_best_height,
             m_opts.matmul_rc_tip_verify_jobs_per_minute);
         parent_mtp = parent->GetMedianTimePast();
@@ -5594,10 +5598,9 @@ void PeerManagerImpl::MaybeStartMatMulRCHeaderVerification(
         return;
     }
 
-    if (budget_debit.refundable && !use_tip_catchup_budget) {
-        CloseMatMulRCGlobalBudgetWindow();
-    }
-
+    // A successful admission consumes its rate debit. Do not also close the
+    // download window: that would idle the verifier and delay the next body for
+    // the full RC budget interval.
     ClearMatMulRCBodyDeferred(hash);
 
     if (params.IsMatMulTrustedReplayAttestationActive(
@@ -6584,11 +6587,8 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
         }
         if (!m_matmul_verify_worker) {
             commit_body_ticket();
-            if (matmul_admission.rc_profile) {
-                if (matmul_admission.rc_budget_work_units == 0) {
-                    CloseMatMulRCGlobalBudgetWindow();
-                }
-            }
+            // The consumed rate debit is the success-path throttle. A download
+            // cooldown here would prevent the next tip body from arriving.
             ProcessBlockSync(node.GetId(), &node, block, force_processing, min_pow_checked, post_process);
             release_admission_marker();
             return;
@@ -6788,11 +6788,8 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
                             node::MatMulVerifyWorker::
                                 EnqueueResult::Joined) {
                         commit_body_ticket();
-                        if (matmul_admission.rc_profile &&
-                            body_budget_debit.refundable &&
-                            matmul_admission.rc_budget_work_units == 0) {
-                            CloseMatMulRCGlobalBudgetWindow();
-                        }
+                        // Accepted async work already owns the paid verifier
+                        // slot; keep block transport open for the following tip.
                         return; // message thread freed
                     }
                 }
@@ -7058,8 +7055,13 @@ bool PeerManagerImpl::AdmitMatMulBlockVerification(
             /*require_matmul_consensus=*/true,
             source_peer->m_their_services.load(),
             node.HasPermission(NetPermissionFlags::NoBan))};
+    const bool catchup_source_is_eligible{
+        IsMatMulRCTipCatchUpSourceEligible(
+            peer_is_eligible, requested_body,
+            source_peer && CanServeBlocks(*source_peer), is_ibd)};
     const bool use_tip_catchup_budget{UseMatMulRCTipCatchUpBudget(
-        requested_body, direct_authenticated_tip_child, peer_is_eligible,
+        requested_body, direct_authenticated_tip_child,
+        catchup_source_is_eligible,
         active_tip_height, peer_best_height,
         m_opts.matmul_rc_tip_verify_jobs_per_minute)};
     const uint32_t tip_catchup_budget_work_units{use_tip_catchup_budget
@@ -7692,10 +7694,10 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             m_num_preferred_download_peers += state->fPreferredDownload;
 
             if (require_matmul_consensus && base_preferred && !state->fPreferredDownload) {
-                LogPrintf("MATMUL WARNING: peer=%d lacks NODE_MATMUL_CONSENSUS service bit; deprioritizing for sync in consensus mode\n", pfrom.GetId());
+                LogPrintf("MATMUL WARNING: peer=%d lacks NODE_MATMUL_CONSENSUS service bit; deprioritizing for IBD\n", pfrom.GetId());
                 if (m_num_preferred_download_peers == 0) {
                     LogPrintf("MATMUL WARNING: no preferred NODE_MATMUL_CONSENSUS sync peers currently connected; "
-                              "RC block download will stall unless a consensus-tier peer connects or this peer is granted explicit noban whitelist permission\n");
+                              "IBD requires a consensus-tier peer, while near-tip sync can use locally verified block-serving peers\n");
                 }
             }
         }
@@ -11319,6 +11321,14 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
         const bool consensus_ok = IsMatMulPeerEligibleForSync(
             require_matmul_consensus, peer->m_their_services,
             pto->HasPermission(NetPermissionFlags::NoBan));
+        const bool initial_block_download{
+            m_chainman.IsInitialBlockDownload()};
+        // NODE_MATMUL_CONSENSUS is a useful IBD preference, not a trust
+        // boundary. Near tip, every downloaded body is verified locally, so
+        // retaining ordinary block-serving peers is both safe and necessary
+        // when the small consensus-tier peer set is intermittent.
+        const bool validated_sync_source{
+            consensus_ok || !initial_block_download};
         const auto preferred_reconcile{
             ReconcileMatMulPreferredDownloadForSync(
                 state.fPreferredDownload,
@@ -11342,7 +11352,7 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                           adjusted_count, recomputed_count);
             }
         }
-        if (!consensus_ok && state.fSyncStarted) {
+        if (!validated_sync_source && state.fSyncStarted) {
             // A peer selected before activation must also relinquish the
             // initial-header-sync slot. Otherwise an ineligible peer can keep
             // the sole slot indefinitely even after losing preferred status.
@@ -11366,7 +11376,7 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                           adjusted_count, recomputed_count);
             }
         }
-        if (!consensus_ok) {
+        if (!validated_sync_source) {
             state.m_chain_sync.m_timeout = 0s;
             state.m_chain_sync.m_work_header = nullptr;
             state.m_chain_sync.m_sent_getheaders = false;
@@ -11386,7 +11396,7 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                 return true;
             }
         }
-        if (state.fPreferredDownload && consensus_ok) {
+        if (state.fPreferredDownload && validated_sync_source) {
             sync_blocks_and_headers_from_peer = true;
         } else if (CanServeBlocks(*peer) && !pto->IsAddrFetchConn()) {
             // Typically this is an inbound peer. If we don't have any outbound
@@ -11399,20 +11409,18 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
             // eventually download it (and not just wait indefinitely for an
             // outbound peer to have it).
             //
-            // In MatMul consensus mode we still deprioritize peers that cannot
-            // serve/validate the MatMul chain, but a peer that DOES advertise
-            // NODE_MATMUL_CONSENSUS (or is NoBan-whitelisted) is exactly what we
-            // want to sync from, even inbound. Mirror the fPreferredDownload
-            // gate above so that a node whose only source of blocks is an
-            // inbound consensus-tier peer does not stall forever (which would
-            // also suppress the low-work anti-DoS headers path for that peer).
-            if (consensus_ok &&
+            // Consensus-tier peers remain preferred during IBD. Near tip, an
+            // ordinary inbound peer is also a valid transport source because
+            // the downloaded body is fully verified here. Mirror the
+            // fPreferredDownload path so an intermittent preferred peer set
+            // cannot stall locally validated block download.
+            if (validated_sync_source &&
                 (m_num_preferred_download_peers == 0 || mapBlocksInFlight.empty())) {
                 sync_blocks_and_headers_from_peer = true;
             }
         }
 
-        if (!state.fSyncStarted && consensus_ok && CanServeBlocks(*peer) && !m_chainman.m_blockman.LoadingBlocks()) {
+        if (!state.fSyncStarted && validated_sync_source && CanServeBlocks(*peer) && !m_chainman.m_blockman.LoadingBlocks()) {
             // Only actively request headers from a single peer, unless we're close to today.
             if ((nSyncStarted == 0 && sync_blocks_and_headers_from_peer) || m_chainman.m_best_header->Time() > NodeClock::now() - 24h) {
                 const CBlockIndex* pindexStart = m_chainman.m_best_header;
@@ -11964,7 +11972,7 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
             ShouldRequestBlocksFromMatMulPeer(
                 /*can_serve_blocks=*/true, consensus_ok,
                 /*request_window_open=*/true, sync_blocks_and_headers_from_peer,
-                IsLimitedPeer(*peer), m_chainman.IsInitialBlockDownload(),
+                IsLimitedPeer(*peer), initial_block_download,
                 state.vBlocksInFlight.size(), MAX_BLOCKS_IN_TRANSIT_PER_PEER)};
         if (should_request_blocks_from_peer) {
             std::vector<const CBlockIndex*> vToDownload;

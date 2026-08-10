@@ -280,6 +280,27 @@ BOOST_AUTO_TEST_CASE(snapshot_background_download_waits_for_tip_catchup)
         /*peer_is_eligible=*/true,
         /*active_height=*/185336, /*peer_best_height=*/185336,
         /*jobs_per_minute=*/4));
+
+    BOOST_CHECK(IsMatMulRCTipCatchUpSourceEligible(
+        /*consensus_tier_or_noban=*/true,
+        /*requested_body=*/false, /*can_serve_blocks=*/false,
+        /*initial_block_download=*/true));
+    BOOST_CHECK(IsMatMulRCTipCatchUpSourceEligible(
+        /*consensus_tier_or_noban=*/false,
+        /*requested_body=*/true, /*can_serve_blocks=*/true,
+        /*initial_block_download=*/true));
+    BOOST_CHECK(IsMatMulRCTipCatchUpSourceEligible(
+        /*consensus_tier_or_noban=*/false,
+        /*requested_body=*/false, /*can_serve_blocks=*/true,
+        /*initial_block_download=*/false));
+    BOOST_CHECK(!IsMatMulRCTipCatchUpSourceEligible(
+        /*consensus_tier_or_noban=*/false,
+        /*requested_body=*/false, /*can_serve_blocks=*/true,
+        /*initial_block_download=*/true));
+    BOOST_CHECK(!IsMatMulRCTipCatchUpSourceEligible(
+        /*consensus_tier_or_noban=*/false,
+        /*requested_body=*/true, /*can_serve_blocks=*/false,
+        /*initial_block_download=*/false));
 }
 
 BOOST_AUTO_TEST_SUITE_END()
