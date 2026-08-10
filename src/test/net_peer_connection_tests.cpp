@@ -197,6 +197,23 @@ BOOST_AUTO_TEST_CASE(snapshot_background_download_waits_for_tip_catchup)
         /*initial_block_download=*/false, /*active_height=*/200,
         /*best_header_height=*/200));
 
+    BOOST_CHECK(ShouldUseBackgroundSnapshotIBDBudget(
+        /*background_sync=*/true, /*requested_block=*/true,
+        /*on_snapshot_base_chain=*/true, /*block_height=*/150,
+        /*snapshot_base_height=*/200));
+    BOOST_CHECK(!ShouldUseBackgroundSnapshotIBDBudget(
+        /*background_sync=*/true, /*requested_block=*/false,
+        /*on_snapshot_base_chain=*/true, /*block_height=*/150,
+        /*snapshot_base_height=*/200));
+    BOOST_CHECK(!ShouldUseBackgroundSnapshotIBDBudget(
+        /*background_sync=*/true, /*requested_block=*/true,
+        /*on_snapshot_base_chain=*/false, /*block_height=*/150,
+        /*snapshot_base_height=*/200));
+    BOOST_CHECK(!ShouldUseBackgroundSnapshotIBDBudget(
+        /*background_sync=*/true, /*requested_block=*/true,
+        /*on_snapshot_base_chain=*/true, /*block_height=*/201,
+        /*snapshot_base_height=*/200));
+
     BOOST_CHECK(ShouldPrioritizeActiveSnapshotChain(
         /*background_sync=*/true, /*active_height=*/150,
         /*peer_best_height=*/200));

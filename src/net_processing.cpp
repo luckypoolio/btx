@@ -10379,7 +10379,27 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
                 const int32_t best_known_height{
                     BestKnownHeightForPeer(
                         pfrom.GetId(), prev_block->nHeight)};
-                is_ibd = m_chainman.IsInitialBlockDownload();
+                const bool background_sync{
+                    m_chainman.BackgroundSyncInProgress()};
+                const CBlockIndex* snapshot_base{
+                    background_sync
+                        ? m_chainman.GetSnapshotBaseBlock()
+                        : nullptr};
+                const CBlockIndex* indexed_block{
+                    m_chainman.m_blockman.LookupBlockIndex(hash)};
+                const bool on_snapshot_base_chain{
+                    indexed_block != nullptr && snapshot_base != nullptr &&
+                    indexed_block->nHeight <= snapshot_base->nHeight &&
+                    snapshot_base->GetAncestor(indexed_block->nHeight) ==
+                        indexed_block};
+                const bool background_snapshot_download{
+                    ShouldUseBackgroundSnapshotIBDBudget(
+                        background_sync, forceProcessing,
+                        on_snapshot_base_chain,
+                        indexed_block != nullptr ? indexed_block->nHeight : -1,
+                        snapshot_base != nullptr ? snapshot_base->nHeight : -1)};
+                is_ibd = m_chainman.IsInitialBlockDownload() ||
+                    background_snapshot_download;
                 if (!is_ibd && m_chainman.ActiveHeight() + 10 < best_known_height) {
                     is_ibd = true;
                 }

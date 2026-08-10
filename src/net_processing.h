@@ -70,6 +70,22 @@ constexpr bool ShouldFetchBackgroundSnapshotBlocks(
         best_header_height >= 0 && active_height >= best_header_height;
 }
 
+/** Requested bodies on the authenticated snapshot-base chain are catch-up
+ * work even when the active snapshot chain is already at network tip. Charge
+ * them to the finite IBD budget so background validation cannot exhaust the
+ * steady-state peer budget and disconnect its block source. */
+constexpr bool ShouldUseBackgroundSnapshotIBDBudget(
+    bool background_sync,
+    bool requested_block,
+    bool on_snapshot_base_chain,
+    int block_height,
+    int snapshot_base_height)
+{
+    return background_sync && requested_block && on_snapshot_base_chain &&
+        block_height >= 0 && snapshot_base_height >= 0 &&
+        block_height <= snapshot_base_height;
+}
+
 /** Whether already queued background downloads should yield to the active
  * snapshot chain. Use the peer's best-known height here: V4 headers do not
  * contribute authenticated work until their block bodies have been verified,
