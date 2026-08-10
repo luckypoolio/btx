@@ -93,6 +93,27 @@ constexpr unsigned int BackgroundSnapshotDownloadBudget(
     return background_slots < available_slots ? background_slots : available_slots;
 }
 
+/** RC ExactReplay is intentionally single-flight and rate limited. While the
+ * authenticated active chain is behind a peer, downloading descendants before
+ * the direct tip child only lets out-of-order bodies consume scarce admission
+ * opportunities and creates a getdata/body retry loop. */
+constexpr bool ShouldSerializeMatMulRCTipDownloads(
+    bool rc_family_active,
+    int active_height,
+    int peer_best_height)
+{
+    return rc_family_active && active_height >= 0 &&
+        peer_best_height > active_height;
+}
+
+constexpr bool IsNextMatMulRCTipBlock(
+    bool serialize_tip_downloads,
+    int active_height,
+    int block_height)
+{
+    return !serialize_tip_downloads || block_height == active_height + 1;
+}
+
 /** Whether a connected peer remains eligible for block/header synchronization
  * once RC consensus-tier preference becomes active. This is evaluated at each
  * selection, rather than only at VERSION time, so a pre-activation preferred

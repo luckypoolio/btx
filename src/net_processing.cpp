@@ -1213,11 +1213,11 @@ private:
     bool MarkMatMulAsyncVerification(const uint256& hash) NO_THREAD_SAFETY_ANALYSIS;
     void UnmarkMatMulAsyncVerification(const uint256& hash) NO_THREAD_SAFETY_ANALYSIS;
     bool IsMatMulAsyncVerificationPending(const uint256& hash) const NO_THREAD_SAFETY_ANALYSIS;
-    /** Bodies deferred to HEADER_ONLY because no RC admission ticket could be
-     *  consumed. A bounded, non-refreshing cooldown prevents a ticketless
-     *  sender from creating an unbounded getdata/block loop without letting it
-     *  indefinitely extend suppression of an honest source. Valid admission
-     *  and terminal verdict paths explicitly clear the hash. */
+    /** Bodies deferred to HEADER_ONLY because a transient RC policy gate (an
+     *  admission ticket or verification budget) could not be consumed. A
+     *  bounded, non-refreshing cooldown prevents an unbounded getdata/block
+     *  loop without letting one source indefinitely suppress an honest peer.
+     *  Valid admission and terminal verdict paths explicitly clear the hash. */
     mutable Mutex m_matmul_rc_deferred_mutex;
     mutable node::RCDeferredBodyCooldowns m_matmul_rc_deferred_bodies
         GUARDED_BY(m_matmul_rc_deferred_mutex);
@@ -6386,6 +6386,12 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
                      "Disconnecting peer=%d: MatMul per-peer verification budget exhausted (block)\n",
                      node.GetId());
             node.fDisconnect = true;
+        }
+        if (matmul_admission.rc_profile) {
+            // Receipt already removed the ordinary in-flight marker. Keep the
+            // same source from immediately redelivering this body on every
+            // message-handler pass while the one-minute RC window is closed.
+            MarkMatMulRCBodyDeferred(hash, node.GetId());
         }
         return false;
     };
@@ -11720,6 +11726,11 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                 : (m_chainman.m_best_header != nullptr
                        ? m_chainman.m_best_header->nHeight
                        : -1)};
+        const int active_height{m_chainman.ActiveHeight()};
+        const bool serialize_rc_tip_downloads{
+            ShouldSerializeMatMulRCTipDownloads(
+                consensusParams.IsMatMulRCFamilyActive(active_height + 1),
+                active_height, peer_best_height)};
         const auto is_background_snapshot_block = [snapshot_base](const CBlockIndex* block) {
             return snapshot_base != nullptr && block != nullptr &&
                 block->nHeight <= snapshot_base->nHeight &&
@@ -11727,24 +11738,32 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
         };
 
         // Requests queued while the snapshot chain was at tip can otherwise
-        // occupy every slot after a new V4 header arrives. Drop only historical
-        // snapshot requests; their bodies can be requested again after catch-up.
-        if (snapshot_base != nullptr && ShouldPrioritizeActiveSnapshotChain(
-                background_sync, m_chainman.ActiveHeight(), peer_best_height)) {
-            std::vector<uint256> background_requests;
+        // occupy every slot after a new V4 header arrives. Historical snapshot
+        // requests yield to foreground sync; under single-flight RC, descendants
+        // also yield to the direct active-tip child. All remain re-requestable.
+        if ((snapshot_base != nullptr && ShouldPrioritizeActiveSnapshotChain(
+                 background_sync, active_height, peer_best_height)) ||
+            serialize_rc_tip_downloads) {
+            std::vector<uint256> lower_priority_requests;
             for (const QueuedBlock& queued : state.vBlocksInFlight) {
-                if (is_background_snapshot_block(queued.pindex)) {
-                    background_requests.push_back(queued.pindex->GetBlockHash());
+                const bool background_request{
+                    is_background_snapshot_block(queued.pindex)};
+                const bool rc_descendant_request{
+                    queued.pindex != nullptr && serialize_rc_tip_downloads &&
+                    queued.pindex->nHeight > active_height + 1};
+                if (background_request || rc_descendant_request) {
+                    lower_priority_requests.push_back(
+                        queued.pindex->GetBlockHash());
                 }
             }
-            for (const uint256& hash : background_requests) {
+            for (const uint256& hash : lower_priority_requests) {
                 RemoveBlockRequest(hash, pto->GetId());
             }
-            if (!background_requests.empty()) {
+            if (!lower_priority_requests.empty()) {
                 LogDebug(BCLog::NET,
-                         "Released %d background snapshot block requests for peer=%d to prioritize active-tip gap=%d\n",
-                         static_cast<int>(background_requests.size()), pto->GetId(),
-                         peer_best_height - m_chainman.ActiveHeight());
+                         "Released %d lower-priority block requests for peer=%d to prioritize active-tip gap=%d\n",
+                         static_cast<int>(lower_priority_requests.size()),
+                         pto->GetId(), peer_best_height - active_height);
             }
         }
 
@@ -11765,7 +11784,21 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
 
             // If a snapshot chainstate is in use, we want to find its next blocks
             // before the background chainstate to prioritize getting to network tip.
-            FindNextBlocksToDownload(*peer, get_inflight_budget(), vToDownload, staller, pto->HasPermission(NetPermissionFlags::Download));
+            FindNextBlocksToDownload(*peer, get_inflight_budget(), vToDownload,
+                                     staller, pto->HasPermission(NetPermissionFlags::Download));
+            if (serialize_rc_tip_downloads) {
+                std::erase_if(
+                    vToDownload,
+                    [active_height](const CBlockIndex* block) {
+                        return block == nullptr ||
+                            !IsNextMatMulRCTipBlock(
+                                /*serialize_tip_downloads=*/true,
+                                active_height, block->nHeight);
+                    });
+                if (vToDownload.size() > 1) {
+                    vToDownload.resize(1);
+                }
+            }
             // Defer genesis→snapshot historical downloads while the active
             // (snapshot) chain is still catching up to network tip. Sharing the
             // per-peer inflight budget with background IBD starves tip catch-up
