@@ -46,6 +46,8 @@ static const unsigned int MAX_HEADERS_RESULTS = 2000;
 static constexpr size_t MAX_SHIELDED_TX_RELAY_BYTES_PER_SECOND{500'000};
 /** Maximum getshieldeddata requests accepted per peer each second. */
 static constexpr size_t MAX_SHIELDEDDATA_REQUESTS_PER_SECOND{8};
+/** Keep most per-peer download capacity available for new active-chain blocks. */
+static constexpr unsigned int MAX_BACKGROUND_SNAPSHOT_BLOCKS_IN_TRANSIT_PER_PEER{2};
 
 /** Whether scarce per-peer block-download capacity may be assigned to the
  * assumeutxo background chain. The active snapshot chain must first be out of
@@ -60,6 +62,35 @@ constexpr bool ShouldFetchBackgroundSnapshotBlocks(
 {
     return background_sync && !limited_peer && !initial_block_download &&
         best_header_height >= 0 && active_height >= best_header_height - 1;
+}
+
+/** Whether already queued background downloads should yield to the active
+ * snapshot chain. Use the peer's best-known height here: V4 headers do not
+ * contribute authenticated work until their block bodies have been verified,
+ * so the global best-header pointer can remain pinned to the active tip. */
+constexpr bool ShouldPrioritizeActiveSnapshotChain(
+    bool background_sync,
+    int active_height,
+    int peer_best_height)
+{
+    return background_sync && peer_best_height >= 0 &&
+        active_height < peer_best_height - 1;
+}
+
+/** Number of additional background blocks this peer may request after active
+ * chain downloads have consumed their slots. */
+constexpr unsigned int BackgroundSnapshotDownloadBudget(
+    bool can_fetch_background,
+    unsigned int background_inflight,
+    unsigned int available_slots)
+{
+    if (!can_fetch_background ||
+        background_inflight >= MAX_BACKGROUND_SNAPSHOT_BLOCKS_IN_TRANSIT_PER_PEER) {
+        return 0;
+    }
+    const unsigned int background_slots{
+        MAX_BACKGROUND_SNAPSHOT_BLOCKS_IN_TRANSIT_PER_PEER - background_inflight};
+    return background_slots < available_slots ? background_slots : available_slots;
 }
 
 /** Whether a connected peer remains eligible for block/header synchronization

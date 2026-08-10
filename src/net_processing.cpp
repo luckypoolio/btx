@@ -11711,6 +11711,43 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
         // Message: getdata (blocks)
         //
         std::vector<CInv> vGetData;
+        const bool background_sync{m_chainman.BackgroundSyncInProgress()};
+        const CBlockIndex* snapshot_base{
+            background_sync ? m_chainman.GetSnapshotBaseBlock() : nullptr};
+        const int peer_best_height{
+            state.pindexBestKnownBlock != nullptr
+                ? state.pindexBestKnownBlock->nHeight
+                : (m_chainman.m_best_header != nullptr
+                       ? m_chainman.m_best_header->nHeight
+                       : -1)};
+        const auto is_background_snapshot_block = [snapshot_base](const CBlockIndex* block) {
+            return snapshot_base != nullptr && block != nullptr &&
+                block->nHeight <= snapshot_base->nHeight &&
+                snapshot_base->GetAncestor(block->nHeight) == block;
+        };
+
+        // Requests queued while the snapshot chain was at tip can otherwise
+        // occupy every slot after a new V4 header arrives. Drop only historical
+        // snapshot requests; their bodies can be requested again after catch-up.
+        if (snapshot_base != nullptr && ShouldPrioritizeActiveSnapshotChain(
+                background_sync, m_chainman.ActiveHeight(), peer_best_height)) {
+            std::vector<uint256> background_requests;
+            for (const QueuedBlock& queued : state.vBlocksInFlight) {
+                if (is_background_snapshot_block(queued.pindex)) {
+                    background_requests.push_back(queued.pindex->GetBlockHash());
+                }
+            }
+            for (const uint256& hash : background_requests) {
+                RemoveBlockRequest(hash, pto->GetId());
+            }
+            if (!background_requests.empty()) {
+                LogDebug(BCLog::NET,
+                         "Released %d background snapshot block requests for peer=%d to prioritize active-tip gap=%d\n",
+                         static_cast<int>(background_requests.size()), pto->GetId(),
+                         peer_best_height - m_chainman.ActiveHeight());
+            }
+        }
+
         const bool can_request_blocks_from_peer{current_time >= state.m_block_download_paused_until};
         const bool should_request_blocks_from_peer{
             CanServeBlocks(*peer) && can_request_blocks_from_peer &&
@@ -11736,20 +11773,30 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
             // integrity re-validation resumes only once the active chain is
             // actually near the best known header. IsInitialBlockDownload()
             // can latch false based on work and tip age before that condition.
-            if (ShouldFetchBackgroundSnapshotBlocks(
-                    m_chainman.BackgroundSyncInProgress(), IsLimitedPeer(*peer),
-                    m_chainman.IsInitialBlockDownload(), m_chainman.ActiveHeight(),
-                    m_chainman.m_best_header != nullptr
-                        ? m_chainman.m_best_header->nHeight
-                        : -1)) {
+            const bool can_fetch_background{ShouldFetchBackgroundSnapshotBlocks(
+                background_sync, IsLimitedPeer(*peer),
+                m_chainman.IsInitialBlockDownload(), m_chainman.ActiveHeight(),
+                peer_best_height)};
+            const unsigned int background_inflight{static_cast<unsigned int>(
+                std::count_if(state.vBlocksInFlight.begin(), state.vBlocksInFlight.end(),
+                              [&is_background_snapshot_block](const QueuedBlock& queued) {
+                                  return is_background_snapshot_block(queued.pindex);
+                              }))};
+            const int available_after_foreground{
+                std::max(0, get_inflight_budget() - static_cast<int>(vToDownload.size()))};
+            const unsigned int background_budget{BackgroundSnapshotDownloadBudget(
+                can_fetch_background, background_inflight,
+                static_cast<unsigned int>(available_after_foreground))};
+            if (background_budget > 0) {
                 // If the background tip is not an ancestor of the snapshot block,
                 // we need to start requesting blocks from their last common ancestor.
-                const CBlockIndex *from_tip = LastCommonAncestor(m_chainman.GetBackgroundSyncTip(), m_chainman.GetSnapshotBaseBlock());
+                const CBlockIndex* from_tip{LastCommonAncestor(
+                    m_chainman.GetBackgroundSyncTip(), snapshot_base)};
                 TryDownloadingHistoricalBlocks(
                     *peer,
-                    get_inflight_budget(),
+                    static_cast<unsigned int>(vToDownload.size()) + background_budget,
                     vToDownload, from_tip,
-                    Assert(m_chainman.GetSnapshotBaseBlock()));
+                    Assert(snapshot_base));
             }
             for (const CBlockIndex *pindex : vToDownload) {
                 uint32_t nFetchFlags = GetFetchFlags(*peer);
