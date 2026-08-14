@@ -262,12 +262,14 @@ static constexpr int BLOCK_FETCH_STALL_HEADERS_AHEAD = 2;
 static constexpr auto BLOCK_FETCH_STALL_IDLE_INTERVAL{45s};
 /** Minimum interval between residual-stall safety-valve kicks (anti-thrash). */
 static constexpr auto BLOCK_FETCH_STALL_KICK_COOLDOWN{60s};
-/** After leaving IBD, request only this many bodies per peer until the lowest
- *  missing body arrives. Filling MAX_BLOCKS_IN_TRANSIT_PER_PEER (16) successors
- *  while the hole is unanswered is the production catch-up stall: one silent
- *  FULL seed pins select=root_in_flight, last_common sits one HAVE_DATA block
- *  past the connected tip, and a restart is required to move a handful of
- *  bodies. IBD keeps the 16-wide window for throughput. */
+/** During serialized catch-up, request only this many bodies per peer until the
+ *  lowest missing body arrives. Filling MAX_BLOCKS_IN_TRANSIT_PER_PEER (16)
+ *  successors while the hole is unanswered is the production catch-up stall:
+ *  one silent FULL seed pins select=root_in_flight, last_common sits one
+ *  HAVE_DATA block past the connected tip, and a restart is required to move a
+ *  handful of bodies. Ordinary IBD keeps the 16-wide window for throughput;
+ *  configured MatMul nodes also use the narrow window in IBD because a missing
+ *  quorum can require a serial ExactReplay of the requested tip child. */
 static constexpr unsigned int CATCHUP_BLOCKS_IN_TRANSIT_PER_PEER = 1;
 /** Catch-up / IBD getdata failover. Mainnet spacing is 90s, so the ordinary
  *  timeout (90–270s) is longer than operators wait before restarting. A FULL
@@ -3236,7 +3238,10 @@ void PeerManagerImpl::MaybeRecoverStalledBlockFetch(std::chrono::microseconds no
         }
     }
     const bool catch_up{IsCatchUpBlockFetch(m_chainman)};
-    const bool narrow_window{catch_up && !m_chainman.IsInitialBlockDownload()};
+    const bool narrow_window{
+        catch_up &&
+        (!m_chainman.IsInitialBlockDownload() ||
+         node::matmul_trusted::IsConfigured())};
     int successors_reclaimed{0};
     if (narrow_window) {
         successors_reclaimed = ReclaimCatchupSuccessorRequests(
@@ -3698,7 +3703,10 @@ void PeerManagerImpl::FindNextBlocksToDownload(const Peer& peer, unsigned int co
 
     const CBlockIndex* tip{m_chainman.ActiveChain().Tip()};
     const bool catch_up{IsCatchUpBlockFetch(m_chainman, state->pindexBestKnownBlock)};
-    const bool narrow_window{catch_up && !m_chainman.IsInitialBlockDownload()};
+    const bool narrow_window{
+        catch_up &&
+        (!m_chainman.IsInitialBlockDownload() ||
+         node::matmul_trusted::IsConfigured())};
     if (narrow_window && count > CATCHUP_BLOCKS_IN_TRANSIT_PER_PEER) {
         count = CATCHUP_BLOCKS_IN_TRANSIT_PER_PEER;
     }
@@ -7117,7 +7125,9 @@ void PeerManagerImpl::HeadersDirectFetchBlocks(CNode& pfrom, const Peer& peer, c
         const bool catch_up{
             IsCatchUpBlockFetch(m_chainman, nodestate->pindexBestKnownBlock)};
         const bool narrow_window{
-            catch_up && !m_chainman.IsInitialBlockDownload()};
+            catch_up &&
+            (!m_chainman.IsInitialBlockDownload() ||
+             node::matmul_trusted::IsConfigured())};
         // Catch-up must not fill 16 newest hashes of a competing headers-only
         // flood. Existing trusted-mirror / claimed-work filters above stay.
         if (narrow_window && !extends_active_tip) {
