@@ -4238,7 +4238,12 @@ void PeerManagerImpl::FindNextBlocks(std::vector<const CBlockIndex*>& vBlocks, c
                 // outstanding request for this block is stale, let another peer
                 // fetch it in parallel (bounded by MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK).
                 // The redundant copy is discarded cheaply if both arrive.
-                if (!MayDuplicateStaleBlockRequest(pindex->GetBlockHash(),
+                // Never select the same peer as an additional owner. BlockRequested
+                // rejects that duplicate, but selecting it here would still enqueue
+                // another GETDATA on every SendMessages pass and flood the peer until
+                // the original request timed out.
+                if (IsBlockRequestedFromPeer(pindex->GetBlockHash(), peer.m_id) ||
+                    !MayDuplicateStaleBlockRequest(pindex->GetBlockHash(),
                                                    GetTime<std::chrono::microseconds>(),
                                                    rerequest_stale_after,
                                                    min_parallel_owners)) {
@@ -16655,9 +16660,11 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                     Assert(m_chainman.GetSnapshotBaseBlock()));
             }
             for (const CBlockIndex *pindex : vToDownload) {
+                // Register ownership before putting the request on the wire. This is
+                // the final guard against duplicate entries selected for one peer.
+                if (!BlockRequested(pto->GetId(), *pindex)) continue;
                 uint32_t nFetchFlags = GetFetchFlags(*peer);
                 vGetData.emplace_back(MSG_BLOCK | nFetchFlags, pindex->GetBlockHash());
-                BlockRequested(pto->GetId(), *pindex);
                 // v4.4 ENC-DR: opportunistically pull the sketch-cache bytes with
                 // the body so the Freivalds fast path may apply (best-effort;
                 // validation never waits, tension-resolution §4.3).
