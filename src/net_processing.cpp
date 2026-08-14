@@ -10183,13 +10183,16 @@ bool PeerManagerImpl::AdmitMatMulBlockVerification(
                         const CBlockIndex* tip{m_chainman.ActiveTip()};
                         const bool has_quorum{node::matmul_trusted::HasQuorum(
                             block_hash, exact_reference_height)};
+                        const bool requested_catchup_tip_child{
+                            is_ibd && force_processing && prev == tip};
                         if (has_quorum) {
                             // Fast-accept: ProcessNewBlock + cached quorum
                             // verdict, no GPU. Do not HEADER_ONLY-drop the body.
                             exact_recompute_required = false;
-                        } else if (indexed == nullptr ||
-                                   !MatMulMaySpendExactReplayGpu(
-                                       m_chainman, tip, indexed)) {
+                        } else if (!requested_catchup_tip_child &&
+                                   (indexed == nullptr ||
+                                    !MatMulMaySpendExactReplayGpu(
+                                        m_chainman, tip, indexed))) {
                             // Live 2026-08-14: unsolicited competing bodies and
                             // a 25–198-wide same-height sibling burst occupied
                             // TipValidation while mining held the device.
@@ -10208,6 +10211,18 @@ bool PeerManagerImpl::AdmitMatMulBlockVerification(
                             if (!persist_unattested_tip_child) {
                                 skip_competing_exactreplay = true;
                             }
+                        } else if (requested_catchup_tip_child) {
+                            // A configured consensus node can know an attested
+                            // frontier without holding quorum for every intervening
+                            // body. During IBD, permit only the explicitly requested
+                            // child of the active tip to ExactReplay. Mining is not
+                            // active in IBD, and the in-flight/root-first limits keep
+                            // this path serial and unavailable to sibling floods.
+                            LogDebug(
+                                BCLog::NET,
+                                "Allowing requested IBD tip-child ExactReplay for %s hash=%s height=%d from peer=%d\n",
+                                source, block_hash.ToString(),
+                                exact_reference_height, node.GetId());
                         }
                     }
                 }
