@@ -5002,8 +5002,23 @@ bool PeerManagerImpl::ConsumeMatMulVerificationBudgetForPeer(
     }
     if (verification_count == 0) return true;
     auto allow_idle_catchup = [&]() -> bool {
-        if (m_matmul_pending_verifications.load(std::memory_order_relaxed) != 0 ||
-            m_matmul_rc_pending_verifications.load(std::memory_order_relaxed) != 0) {
+        if (!is_ibd) return false;
+
+        // Admission reserves this verification's pending-work slot before it
+        // consumes the permanent rate budget. Treat that reservation as idle;
+        // the old zero-only check could never succeed for the current job and
+        // made a retained tip child retry until the one-minute source window
+        // reset. Any work beyond this reservation still blocks the exception.
+        const uint32_t legacy_pending{
+            m_matmul_pending_verifications.load(std::memory_order_relaxed)};
+        const uint32_t rc_pending{
+            m_matmul_rc_pending_verifications.load(std::memory_order_relaxed)};
+        const uint32_t current_lane_pending{
+            rc_recompute ? rc_pending : legacy_pending};
+        const uint32_t other_lane_pending{
+            rc_recompute ? legacy_pending : rc_pending};
+        if (current_lane_pending != verification_count ||
+            other_lane_pending != 0) {
             return false;
         }
         LogDebug(BCLog::NET,
