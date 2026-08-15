@@ -39,6 +39,7 @@
 #include <policy/rbf.h>
 #include <policy/settings.h>
 #include <policy/truc_policy.h>
+#include <matmul/matmul_v4_rc.h>
 #include <matmul/matmul_v4_rc_stage3_consensus.h>
 #include <matmul/matmul_v4_rc_stage3_producer.h>
 #include <pow.h>
@@ -9332,6 +9333,14 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
         return state.Error(std::string(RETRYABLE_MATMUL_ACTIVATION_PREFIX) +
                            ": trusted attestation quorum Timeout");
     }
+    // Genesis (height 0) must still connect so LoadChainTip can attach the
+    // chain. After that, honor shutdown before ReadBlock / ConnectBlock so
+    // ABC cannot ignore m_interrupt on the first reconnect of a reorg
+    // (live: inner ABC loop held cs_main; version handshakes timed out).
+    if (pindexNew->nHeight > 0 && m_chainman.m_interrupt) {
+        return state.Error(std::string(RETRYABLE_MATMUL_ACTIVATION_PREFIX) +
+                           ": shutdown interrupt");
+    }
     // Read block from disk.
     const auto time_1{SteadyClock::now()};
     std::shared_ptr<const CBlock> pthisBlock;
@@ -9508,6 +9517,7 @@ CBlockIndex* Chainstate::FindMostWorkChain()
 {
     AssertLockHeld(::cs_main);
     std::vector<CBlockIndex*> hysteresis_deferred_candidates;
+    std::set<CBlockIndex*> skipped_this_call;
     const auto restore_hysteresis_deferred_candidates = [&]() {
         for (CBlockIndex* candidate : hysteresis_deferred_candidates) {
             setBlockIndexCandidates.insert(candidate);
@@ -9516,6 +9526,10 @@ CBlockIndex* Chainstate::FindMostWorkChain()
     };
 
     do {
+        if (m_chainman.m_interrupt) {
+            restore_hysteresis_deferred_candidates();
+            return nullptr;
+        }
         CBlockIndex *pindexNew = nullptr;
 
         // Find the best candidate header.
@@ -9539,8 +9553,15 @@ CBlockIndex* Chainstate::FindMostWorkChain()
             // child of an attested ancestor is not competing and is left
             // alone. Insert so ConnectTip / CheckBlockIndex see the new
             // tip in the candidate set.
-            pindexNew = abandon;
-            setBlockIndexCandidates.insert(abandon);
+            //
+            // Do not re-insert a candidate this call already skipped.
+            // Erase+continue then FindUniqueCompetingAttestedIndex would
+            // otherwise livelock FindMostWorkChain with cs_main held
+            // (PR 105 comment 5301483741: b-initload 100% CPU, 0 peers).
+            if (skipped_this_call.count(abandon) == 0) {
+                pindexNew = abandon;
+                setBlockIndexCandidates.insert(abandon);
+            }
         }
 
         if (m_chainman.IsOnParkedReorgBranch(pindexNew)) {
@@ -9559,6 +9580,7 @@ CBlockIndex* Chainstate::FindMostWorkChain()
                 m_chainman.IsAttestedAbandonForkCandidate(pindexNew)};
             if (!authority_escape ||
                 !m_chainman.UnparkReorgBranchContainingBlock(pindexNew)) {
+                skipped_this_call.insert(pindexNew);
                 setBlockIndexCandidates.erase(pindexNew);
                 continue;
             }
@@ -9570,6 +9592,7 @@ CBlockIndex* Chainstate::FindMostWorkChain()
             LogWarning("%s: deferring losing-tip extension hash=%s height=%d while authenticated reorg recovery is armed\n",
                        __func__, pindexNew->GetBlockHash().ToString(),
                        pindexNew->nHeight);
+            skipped_this_call.insert(pindexNew);
             setBlockIndexCandidates.erase(pindexNew);
             continue;
         }
@@ -9578,6 +9601,7 @@ CBlockIndex* Chainstate::FindMostWorkChain()
             LogDebug(BCLog::VALIDATION,
                      "FindMostWorkChain: skipping unattested competing candidate hash=%s height=%d\n",
                      pindexNew->GetBlockHash().ToString(), pindexNew->nHeight);
+            skipped_this_call.insert(pindexNew);
             setBlockIndexCandidates.erase(pindexNew);
             continue;
         }
@@ -9593,6 +9617,15 @@ CBlockIndex* Chainstate::FindMostWorkChain()
         // child (getchaintips: height 11 active + height 12 valid-headers,
         // same parent, no competing branch) must stay selectable so
         // ConnectTip can wait for quorum instead of deferring forever.
+        //
+        // CONSENSUS (live 2026-08-15 2fd67f18): a followed HAVE_DATA
+        // tip-child must remain selectable even when an unfollowed
+        // attested sibling exists. TRUSTED mirrors must not use that
+        // bypass: the first HAVE_DATA twin becomes m_best_header, so it
+        // looks "followed", and skipping the overlay proposes the
+        // unattested twin (bfd10a67 / 5e6df697 regression vs 34aeb78b).
+        // ABC still refused to connect it; FindMostWorkChain must not
+        // propose it (GBT and other callers).
         if (node::matmul_trusted::IsConfigured() &&
             m_chain.Tip() != nullptr &&
             m_chainman.GetConsensus().IsMatMulTrustedReplayAttestationActive(
@@ -9604,7 +9637,10 @@ CBlockIndex* Chainstate::FindMostWorkChain()
             const bool has_quorum{node::matmul_trusted::HasQuorum(
                 pindexNew->GetBlockHash(), pindexNew->nHeight)};
             const CBlockIndex* attested_sibling{nullptr};
-            if (extends_tip && !has_quorum) {
+            const bool consensus_followed_tip_child{
+                !node::matmul_trusted::IsTrustedMirror() &&
+                m_chainman.IndexIsFollowedTipChild(tip, pindexNew)};
+            if (extends_tip && !has_quorum && !consensus_followed_tip_child) {
                 auto consider_attested_tip_child = [&](const CBlockIndex* alt) {
                     if (alt == nullptr) return false;
                     if (node::matmul_trusted::TrustedMirrorAttestedSiblingIsActionable(
@@ -9666,6 +9702,7 @@ CBlockIndex* Chainstate::FindMostWorkChain()
                          pindexNew->nHeight,
                          attested_sibling->GetBlockHash().ToString(),
                          attested_sibling->nHeight);
+                skipped_this_call.insert(pindexNew);
                 setBlockIndexCandidates.erase(pindexNew);
                 hysteresis_deferred_candidates.push_back(pindexNew);
                 continue;
@@ -10220,6 +10257,14 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
                 }
 
                 if (pindexMostWork == nullptr) {
+                    // Stuck ABC never takes a step, so NormalizeReorgRecovery
+                    // after ActivateBestChainStep never runs. Clear a stale
+                    // record before selecting most-work (live 2026-08-15:
+                    // armed 01:38 recovery kept 2fd67f18 out of the set).
+                    if (this == &m_chainman.ActiveChainstate() &&
+                        !m_chainman.NormalizeReorgRecovery(m_chain.Tip())) {
+                        return state.Error("failed to persist completed reorg recovery transition");
+                    }
                     pindexMostWork = FindMostWorkChain();
                 }
 
@@ -10234,6 +10279,7 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
                 // in case snapshot validation is completed during ActivateBestChainStep, the
                 // result of GetRole() changes from BACKGROUND to NORMAL.
                const ChainstateRole chainstate_role{this->GetRole()};
+                CBlockIndex* const tip_before_step{m_chain.Tip()};
                 if (!ActivateBestChainStep(state, pindexMostWork, pblock && pblock->GetHash() == pindexMostWork->GetBlockHash() ? pblock : nullBlockPtr, fInvalidFound, connectTrace)) {
                     // A system error occurred
                     return false;
@@ -10274,6 +10320,22 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
                 //
                 // Break this do-while to ensure we don't advance past the base snapshot.
                 if (m_disabled) {
+                    break;
+                }
+                // No chain movement and not a fork-choice wipe: stop. A
+                // successful ABCStep that neither connects nor invalidates
+                // would otherwise retry forever while tip is worse than
+                // starting_tip (inner comparator), holding cs_main.
+                if (m_chain.Tip() == tip_before_step && !fInvalidFound) {
+                    // Inner do-while exits on an unchanged tip (equal work),
+                    // but the outer loop is `pindexNewTip != pindexMostWork`.
+                    // Leaving the unconnectable target set retries ABC with
+                    // cs_main held (PR 105 comment 5301483741: restart
+                    // livelock on a pending attested child).
+                    LogWarning("ActivateBestChain: no progress toward %s; "
+                               "stopping activation so RPC/net can complete\n",
+                               pindexMostWork->GetBlockHash().ToString());
+                    retryable_matmul_deferred = true;
                     break;
                 }
             } while (!m_chain.Tip() || (starting_tip && CBlockIndexWorkComparator()(m_chain.Tip(), starting_tip)));
@@ -10611,9 +10673,19 @@ void Chainstate::ResetBlockFailureFlags(CBlockIndex *pindex) {
 void Chainstate::TryAddBlockIndexCandidate(CBlockIndex* pindex)
 {
     AssertLockHeld(cs_main);
-    if (m_chainman.IsOnParkedReorgBranch(pindex) ||
-        m_chainman.ShouldDeferLosingTipExtension(pindex) ||
-        !TrustedMirrorShouldConsiderMostWorkCandidate(m_chain.Tip(), pindex)) {
+    const CBlockIndex* const tip{m_chain.Tip()};
+    const bool parked{m_chainman.IsOnParkedReorgBranch(pindex)};
+    const bool defer_losing{m_chainman.ShouldDeferLosingTipExtension(pindex)};
+    const bool consider{TrustedMirrorShouldConsiderMostWorkCandidate(tip, pindex)};
+    if (parked || defer_losing || !consider) {
+        if (pindex != nullptr && tip != nullptr && pindex->pprev == tip) {
+            LogWarning("%s: refusing tip-child hash=%s height=%d parked=%s "
+                       "defer_losing_tip=%s consider_most_work=%s\n",
+                       __func__, pindex->GetBlockHash().ToString(),
+                       pindex->nHeight, parked ? "yes" : "no",
+                       defer_losing ? "yes" : "no",
+                       consider ? "yes" : "no");
+        }
         return;
     }
 
@@ -10621,9 +10693,13 @@ void Chainstate::TryAddBlockIndexCandidate(CBlockIndex* pindex)
     // or more work than our current tip. Attested abandon-fork targets are the
     // exception: they must be selectable while the unattested tip still has
     // more work.
-    if (m_chain.Tip() != nullptr &&
-        setBlockIndexCandidates.value_comp()(pindex, m_chain.Tip()) &&
+    if (tip != nullptr &&
+        setBlockIndexCandidates.value_comp()(pindex, tip) &&
         !m_chainman.IsAttestedAbandonForkCandidate(pindex)) {
+        if (pindex != nullptr && pindex->pprev == tip) {
+            LogWarning("%s: refusing tip-child hash=%s height=%d less_work_than_tip=yes\n",
+                       __func__, pindex->GetBlockHash().ToString(), pindex->nHeight);
+        }
         return;
     }
 
@@ -11112,11 +11188,31 @@ const CBlockIndex* ChainstateManager::FindUniqueCompetingAttestedIndex() const
         consider(idx);
     }
 
+    if (tip_has_quorum) {
+        std::vector<const CBlockIndex*> suffix;
+        suffix.reserve(competing.size());
+        for (const CBlockIndex* idx : competing) {
+            const CBlockIndex* const lca{LastCommonAncestor(tip, idx)};
+            if (lca == tip && idx->nHeight > tip->nHeight) {
+                suffix.push_back(idx);
+            }
+        }
+        // Live 2026-08-15: quorum tip 189675 893c7c9b had unique attested
+        // HAVE_DATA child fecb5b4f, but attested HAVE_DATA 19625a1e (child
+        // of competing 189675 1fbccf3f) sat in the short-reorg window.
+        // Uniqueness then bailed, GBT kept mining, and ABC never caught
+        // up. Prefer the attested suffix of this quorum tip over a
+        // short-reorg away from it.
+        if (!suffix.empty()) {
+            competing = std::move(suffix);
+        }
+    }
+
     // Historical dual-attested siblings remain in the durable frontier hint
-    // set. A shorter dead-end sibling must not mask a strictly heavier
-    // attested descendant chain forever. Rank the complete candidate set
-    // first, then fail closed only when incomparable candidates tie for the
-    // greatest accumulated work.
+    // set. After preferring a direct attested suffix, rank the complete
+    // remaining candidate set so a shorter dead-end sibling cannot mask a
+    // strictly heavier attested descendant chain. Fail closed only when
+    // incomparable candidates tie for the greatest accumulated work.
     const CBlockIndex* unique{nullptr};
     for (const CBlockIndex* idx : competing) {
         if (unique == nullptr || idx->nChainWork > unique->nChainWork) {
@@ -11299,6 +11395,19 @@ bool ChainstateManager::IsAutomaticReorgRecoveryCandidate(
     return true;
 }
 
+bool ChainstateManager::IndexIsFollowedTipChild(
+    const CBlockIndex* tip, const CBlockIndex* index) const
+{
+    AssertLockHeld(::cs_main);
+    if (tip == nullptr || index == nullptr || index->pprev != tip) return false;
+    if ((index->nStatus & BLOCK_FAILED_MASK) != 0) return false;
+    const CBlockIndex* const followed{m_best_header};
+    return followed != nullptr &&
+           followed->nHeight >= index->nHeight &&
+           followed->GetAncestor(tip->nHeight) == tip &&
+           followed->GetAncestor(index->nHeight) == index;
+}
+
 bool ChainstateManager::ShouldDeferLosingTipExtension(
     const CBlockIndex* candidate) const
 {
@@ -11307,11 +11416,25 @@ bool ChainstateManager::ShouldDeferLosingTipExtension(
         m_active_chainstate == nullptr) {
         return false;
     }
+    // Live 2026-08-15: unique attested HAVE_DATA suffix of the current
+    // quorum tip (189676 fecb5b4f) was also classified as a losing-tip
+    // extension because recovery was armed on a competing 189675.
+    // FindMostWorkChain then erased it and looped, wedging ABC / RPC.
+    // Catch-up / unique attested abandon must not be frozen by that
+    // barrier.
+    if (IsAttestedAbandonForkCandidate(candidate)) {
+        return false;
+    }
     const CBlockIndex* const active_tip{m_active_chainstate->m_chain.Tip()};
     const CBlockIndex* const losing_tip{
         m_blockman.LookupBlockIndex(m_reorg_recovery->losing_tip_hash)};
     const CBlockIndex* const recovery_root{
         m_blockman.LookupBlockIndex(m_reorg_recovery->recovery_root_hash)};
+    // Followed validator-chain tip-child only. A blanket pprev==tip bypass
+    // would also admit competing siblings (live 14c0d0e4 / e80753f4).
+    if (IndexIsFollowedTipChild(active_tip, candidate)) {
+        return false;
+    }
     return active_tip != nullptr && candidate != active_tip &&
            BlockIndexDescends(active_tip, losing_tip) &&
            BlockIndexDescends(candidate, losing_tip) &&
@@ -11541,14 +11664,42 @@ bool ChainstateManager::NormalizeReorgRecovery(const CBlockIndex* active_tip)
                 authenticated_tip->HaveNumChainTxs() &&
                 IsBlockAuthenticated(*authenticated_tip, GetConsensus())))};
 
-    if (recovery_won || !provenance_valid) {
+    // CONSENSUS only. TRUSTED records must keep reconstructing m_best_header
+    // onto authenticated_tip while the authority body is still in flight.
+    // Live 2026-08-15: CONSENSUS recovery armed at 01:38 on 1fbccf3f never
+    // completed; the followed/quorum chain stayed on the "losing" side
+    // through attested 189685, and every later tip-child was deferred.
+    const bool followed_stayed_on_losing_side{
+        m_best_header != nullptr && losing_tip != nullptr &&
+        m_best_header->nHeight > losing_tip->nHeight &&
+        BlockIndexDescends(m_best_header, losing_tip) &&
+        !BlockIndexDescends(m_best_header, recovery_root)};
+    bool quorum_on_losing_side{false};
+    if (active_tip != nullptr && losing_tip != nullptr) {
+        for (const CBlockIndex* walk{active_tip};
+             walk != nullptr && walk->nHeight > losing_tip->nHeight;
+             walk = walk->pprev) {
+            if (node::matmul_trusted::HasQuorum(
+                    walk->GetBlockHash(), walk->nHeight)) {
+                quorum_on_losing_side = true;
+                break;
+            }
+        }
+    }
+    const bool losing_side_now_canonical{
+        !trusted_record && !recovery_won && active_tip != nullptr &&
+        losing_tip != nullptr && BlockIndexDescends(active_tip, losing_tip) &&
+        (quorum_on_losing_side || followed_stayed_on_losing_side)};
+    if (recovery_won || !provenance_valid || losing_side_now_canonical) {
         if (m_blockman.m_block_tree_db &&
             !m_blockman.m_block_tree_db->WriteReorgRecoveryRecord(std::nullopt)) {
             LogError("%s: failed to clear stale reorg recovery record\n", __func__);
             return false;
         }
         LogWarning("%s: cleared %s reorg recovery record\n", __func__,
-                   recovery_won ? "completed" : "stale or unauthenticated");
+                   recovery_won ? "completed"
+                   : losing_side_now_canonical ? "losing-side-became-canonical"
+                                               : "stale or unauthenticated");
         m_reorg_recovery.reset();
         if (!recovery_won) {
             for (Chainstate* chainstate : GetAll()) {
@@ -12919,6 +13070,8 @@ static bool ContextualCheckBlock(const CBlock& block,
                         }
                         return true;
                     }
+                    const matmul::v4::rc::ScopedExactReplayCancellation
+                        shutdown_cancel{&chainman.m_interrupt.Flag()};
                     const auto outcome{
                         CheckMatMulProofOfWork_RCOutcome(
                             block, consensusParams, nHeight,
@@ -13434,7 +13587,20 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
 
     // NOTE: deal better with return value and error conditions for duplicate
     // and unrequested blocks.
-    if (fAlreadyHave) return true;
+    // Live 2026-08-15: HEADER_ONLY / persist-without-GPU left 189686
+    // 2fd67f18 HAVE_DATA. A later header ExactReplay persisted
+    // BLOCK_EXACT_REPLAY_VERIFIED without ReceivedBlockTransactions /
+    // ConnectTip, so submitblock still returned "duplicate" and ABC
+    // never selected the validator-chain child of attested 189685.
+    // Re-enter ContextualCheck + (if needed) ReceivedBlockTransactions
+    // for any requested/forced unconnected tip-child.
+    const bool reverify_tip_child{
+        fAlreadyHave && fRequested &&
+        pindex->pprev != nullptr &&
+        pindex->pprev == ActiveTip() &&
+        !ActiveChain().Contains(pindex) &&
+        (pindex->nStatus & BLOCK_FAILED_MASK) == 0};
+    if (fAlreadyHave && !reverify_tip_child) return true;
     if (!fRequested) {  // If we didn't ask for it:
         // Followed-chain historical holes (active-tip / snapshot-base
         // ancestors) are less-work by construction and may be pruned
@@ -13496,7 +13662,21 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
     // ReceivedBlockTransactions for the same block. (A remote peer cannot
     // trigger this — the message handler is single-threaded — but a concurrent
     // RPC/reindex can.)
-    if (pindex->nStatus & BLOCK_HAVE_DATA) return true;
+    // Followed HAVE_DATA tip-child catch-up: the body is already on disk but
+    // nTx / VALID_TRANSACTIONS may never have been raised. Do not skip
+    // ReceivedBlockTransactions in that case — otherwise ABC cannot select it.
+    if (pindex->nStatus & BLOCK_HAVE_DATA) {
+        if (reverify_tip_child && pindex->nTx == 0) {
+            const FlatFilePos pos{pindex->GetBlockPos()};
+            if (!pos.IsNull()) {
+                ReceivedBlockTransactions(block, pindex, pos);
+            }
+        }
+        if (reverify_tip_child) {
+            ActiveChainstate().TryAddBlockIndexCandidate(pindex);
+        }
+        return true;
+    }
 
     // Header is valid/has work, merkle tree and segwit merkle tree are good...RELAY NOW
     // (but if it does not build on our best tip, let the SendMessages loop relay it)

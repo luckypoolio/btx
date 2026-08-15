@@ -1565,6 +1565,7 @@ public:
     bool MaybeTrackReorgRecovery(const CBlockIndex* candidate) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     bool LoadReorgRecoveryRecord() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     bool NormalizeReorgRecovery(const CBlockIndex* active_tip) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    [[nodiscard]] bool IndexIsFollowedTipChild(const CBlockIndex* tip, const CBlockIndex* index) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     bool ShouldDeferLosingTipExtension(const CBlockIndex* candidate) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     bool IsAutomaticReorgRecoveryCandidate(const CBlockIndex* candidate) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     /**
@@ -1598,13 +1599,11 @@ public:
      * attested index is on the active chain (pending-attestation extension
      * — do not disconnect it) or if two incomparable attested branches exist.
      *
-     * When the active tip already has quorum: still return the strictly
-     * greater-work competing attested HAVE_DATA short-reorg frontier (every
-     * frontier hint at a height, not last-writer). Lower-work stale siblings
-     * do not mask a longer frontier or rewind the active tip; equal-work
-     * equivocations remain ambiguous. Live 2026-08-15: old dual-attested
-     * siblings stranded trusted mirrors behind a longer signed frontier and
-     * later made them alternate between recent branches.
+     * When the active tip already has quorum: prefer its unique attested
+     * HAVE_DATA suffix, otherwise return the strictly greater-work competing
+     * attested short-reorg frontier (every frontier hint at a height, not
+     * last-writer). Lower-work stale siblings do not mask a longer frontier or
+     * rewind the active tip; equal-work equivocations remain ambiguous.
      *
      * Also return the unique attested HAVE_DATA suffix child of that tip
      * (LCA depth 0, height > tip). That is catch-up, not a reorg: the
