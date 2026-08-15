@@ -11051,23 +11051,24 @@ const CBlockIndex* ChainstateManager::FindUniqueCompetingAttestedIndex() const
         consider(idx);
     }
 
+    // Historical dual-attested siblings remain in the durable frontier hint
+    // set. A shorter dead-end sibling must not mask a strictly heavier
+    // attested descendant chain forever. Rank the complete candidate set
+    // first, then fail closed only when incomparable candidates tie for the
+    // greatest accumulated work.
     const CBlockIndex* unique{nullptr};
     for (const CBlockIndex* idx : competing) {
-        if (unique == nullptr) {
+        if (unique == nullptr || idx->nChainWork > unique->nChainWork) {
             unique = idx;
-            continue;
         }
-        if (BlockIndexDescends(idx, unique)) {
-            unique = idx;
-            continue;
-        }
-        if (BlockIndexDescends(unique, idx)) continue;
+    }
+    if (unique == nullptr) return nullptr;
+    for (const CBlockIndex* idx : competing) {
+        if (idx == unique || idx->nChainWork != unique->nChainWork) continue;
         if (!BlockIndexComparable(unique, idx)) {
             return nullptr;
         }
-        if (CBlockIndexWorkComparator()(unique, idx)) unique = idx;
     }
-    if (unique == nullptr) return nullptr;
     if (tip_has_quorum) {
         const CBlockIndex* const lca{LastCommonAncestor(tip, unique)};
         if (lca == nullptr) return nullptr;
@@ -11086,7 +11087,12 @@ const CBlockIndex* ChainstateManager::FindUniqueCompetingAttestedIndex() const
                 fork_child->GetBlockHash(), fork_child->nHeight)) {
             return nullptr;
         }
-        return fork_child;
+        // Return the attested frontier itself, not only its first child after
+        // the fork. ActivateBestChain treats the selected index as the whole
+        // activation target and otherwise stops after switching one block,
+        // leaving an already-known signed descendant chain stranded until an
+        // unrelated later event happens to invoke activation again.
+        return unique;
     }
     // Equal-work attested sibling (lost race) and more-work attested
     // chain (signer pulled ahead) must switch; less-work attested
