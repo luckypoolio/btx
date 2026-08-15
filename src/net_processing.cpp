@@ -269,11 +269,12 @@ static constexpr auto BLOCK_FETCH_STALL_KICK_COOLDOWN{60s};
  *  past the connected tip, and a restart is required to move a handful of
  *  bodies. IBD keeps the 16-wide window for throughput. */
 static constexpr unsigned int CATCHUP_BLOCKS_IN_TRANSIT_PER_PEER = 1;
-/** Catch-up / IBD getdata failover. Mainnet spacing is 90s, so the ordinary
- *  timeout (90–270s) is longer than operators wait before restarting. A FULL
- *  seed can serve a ~400-byte body in well under a second. Applied during IBD
- *  as well so a long-offline miner failsovers instead of waiting 180s. */
-static constexpr auto BLOCK_CATCHUP_DOWNLOAD_TIMEOUT{15s};
+/** Catch-up / IBD getdata failover. Mainnet spacing is 90s, so this remains
+ *  quicker than the ordinary 90–270s timeout while allowing an archive peer to
+ *  drain a window of large historical block messages over a WAN link. The old
+ *  15s bound repeatedly disconnected a healthy sole peer while it was still
+ *  advancing the tip. */
+static constexpr auto BLOCK_CATCHUP_DOWNLOAD_TIMEOUT{60s};
 /** Second FULL peer may take the catch-up hole immediately (bodies are cheap).
  *  A third waits until the existing owners are stale. */
 static constexpr size_t CATCHUP_MIN_PARALLEL_OWNERS = 2;
@@ -16480,22 +16481,24 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                     }
                 }
                 ++state.m_block_download_timeout_count;
-                // Prefer re-request over disconnect when other download peers
-                // exist: dropping this peer also discards its other useful
-                // in-flight blocks. Still disconnect if this is the only
-                // download peer or the peer keeps timing out.
+                // A first timeout is not proof that a peer is dead, especially
+                // when it is the only archive serving historical bodies. Keep
+                // it for bounded retries; any useful owned delivery resets the
+                // counter. Alternative peers get a short preference window.
                 const bool can_rerequest_elsewhere = peers_downloading_before > 1;
                 const bool persistent_timeout =
                     state.m_block_download_timeout_count >= BLOCK_DOWNLOAD_TIMEOUT_DISCONNECT_AFTER;
-                if (can_rerequest_elsewhere && !persistent_timeout) {
-                    state.m_block_download_paused_until =
-                        current_time + BLOCK_DOWNLOAD_TIMEOUT_REREQUEST_COOLDOWN;
+                if (!persistent_timeout) {
+                    if (can_rerequest_elsewhere) {
+                        state.m_block_download_paused_until =
+                            current_time + BLOCK_DOWNLOAD_TIMEOUT_REREQUEST_COOLDOWN;
+                    }
                     LogInfo("Timeout downloading block %s (in flight %ds) from peer=%d; "
-                            "releasing for re-request (other download peers=%d, consecutive_timeouts=%d)\n",
+                            "releasing for retry (other download peers=%d, consecutive_timeouts=%d)\n",
                             stuck_hash.ToString(), inflight_secs, pto->GetId(),
                             peers_downloading_before - 1, state.m_block_download_timeout_count);
-                    // Continue SendMessages so this pass can still allocate
-                    // getdata to other peers; do not disconnect.
+                    // Continue SendMessages so this pass can allocate getdata
+                    // to another peer, or back to this sole peer.
                 } else {
                     LogInfo("Timeout downloading block %s (in flight %ds), %s "
                             "(consecutive_timeouts=%d, download_peers_was=%d)\n",

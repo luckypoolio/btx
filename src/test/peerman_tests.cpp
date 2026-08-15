@@ -2029,7 +2029,10 @@ BOOST_AUTO_TEST_CASE(catchup_requests_only_lowest_hole_and_fails_over_silent_pee
     BOOST_REQUIRE_EQUAL(second_stats.vHeightInFlight.size(), 1U);
     BOOST_CHECK_EQUAL(second_stats.vHeightInFlight.front(), tip->nHeight + 1);
 
-    SetMockTime(std::chrono::seconds{GetTime() + 16});
+    // Cross the WAN-tolerant catch-up timeout. The second peer already owns
+    // the same lowest hole, so the silent peer should release its slot and
+    // enter the short alternate-peer cooldown without being disconnected.
+    SetMockTime(std::chrono::seconds{GetTime() + 61});
     BOOST_CHECK(peerman.SendMessages(&silent));
     CNodeStateStats silent_after;
     BOOST_REQUIRE(peerman.GetNodeStateStats(silent.GetId(), silent_after));
