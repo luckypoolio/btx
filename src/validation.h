@@ -1316,8 +1316,10 @@ public:
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     /** Record that the current process observed a valid configured M-of-N
-     *  quorum. Persisted solely for operator audit; validation never consumes
-     *  this bit as authority after restart/config rotation. */
+     *  quorum. Recompute authenticated work and restore ready descendants to
+     *  the candidate set so a quorum arriving after HAVE_DATA can immediately
+     *  retry normal most-work activation. Persisted authority is accepted on
+     *  restart only when the current configured quorum archive proves it. */
     bool PersistMatMulTrustedReplayAttestation(const uint256& block_hash)
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 

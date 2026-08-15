@@ -2537,17 +2537,59 @@ BOOST_AUTO_TEST_CASE(unrequested_followed_tip_child_persists_without_gpu)
             }
         }
     }
+
+    // The body was accepted before quorum and ConnectTip deferred it. A late
+    // MMATTEST must promote the existing index and trigger activation without
+    // requiring another BLOCK message or operator invalidateblock.
+    matmul::trusted::ExactReplayStatement statement;
+    statement.chain_id = uint256::FromHex(std::string(64, '1')).value();
+    statement.block_hash = child_hash;
+    statement.block_height = activation;
+    statement.replay_authority_context =
+        uint256::FromHex(std::string(64, '2')).value();
+    auto attestation{matmul::trusted::SignStatement(statement, signer)};
+    BOOST_REQUIRE(attestation.has_value());
+    std::vector<matmul::trusted::ExactReplayAttestation> mmattest{
+        *attestation};
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(
+        peer, NetMsg::Make(NetMsgType::MMATTEST, mmattest)));
+    peer.fPauseSend = false;
+    (void)connman.ProcessMessagesOnce(peer);
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+
     {
         LOCK(::cs_main);
-        chainman.SetBestHeader(const_cast<CBlockIndex*>(chainman.ActiveTip()));
-        CBlockIndex* persisted{
+        const CBlockIndex* idx{chainman.m_blockman.LookupBlockIndex(child_hash)};
+        BOOST_REQUIRE(idx != nullptr);
+        BOOST_CHECK(idx->nStatus & BLOCK_TRUSTED_REPLAY_ATTESTED);
+        BOOST_CHECK(idx->IsValid(BLOCK_VALID_SCRIPTS));
+        BOOST_CHECK_EQUAL(chainman.ActiveTip(), idx);
+        BOOST_CHECK_EQUAL(idx->nAuthenticatedChainWork.GetHex(),
+                          idx->nChainWork.GetHex());
+        CBlockIndex* mutable_idx{
             chainman.m_blockman.LookupBlockIndex(child_hash)};
-        if (persisted != nullptr) {
-            persisted->nStatus &= ~BLOCK_HAVE_DATA;
-            persisted->nTx = 0;
-            persisted->m_chain_tx_count = 0;
-            chainman.ActiveChainstate().setBlockIndexCandidates.erase(persisted);
-        }
+        BOOST_REQUIRE(mutable_idx != nullptr);
+        mutable_idx->nStatus &= ~BLOCK_TRUSTED_REPLAY_ATTESTED;
+        mode = kernel::MatMulValidationMode::CONSENSUS;
+    }
+
+    // Production miners run consensus verification with a configured signer
+    // key. A duplicate signature must also repair provenance written by an
+    // older build without letting ordinary replays repeatedly run activation.
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(
+        peer, NetMsg::Make(NetMsgType::MMATTEST, mmattest)));
+    peer.fPauseSend = false;
+    (void)connman.ProcessMessagesOnce(peer);
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+
+    {
+        LOCK(::cs_main);
+        const CBlockIndex* mutable_idx{
+            chainman.m_blockman.LookupBlockIndex(child_hash)};
+        BOOST_REQUIRE(mutable_idx != nullptr);
+        BOOST_CHECK(mutable_idx->nStatus & BLOCK_TRUSTED_REPLAY_ATTESTED);
+        BOOST_CHECK_EQUAL(mutable_idx->nAuthenticatedChainWork.GetHex(),
+                          mutable_idx->nChainWork.GetHex());
     }
 }
 

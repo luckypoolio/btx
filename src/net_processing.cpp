@@ -14459,6 +14459,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         // node-wide relay allowance: valid public attestations are replayable
         // by anyone.
         bool wake_block_fetch{false};
+        bool retry_chain_activation{false};
         for (const auto& attestation : received) {
             const uint256 hash{
                 attestation.statement.block_hash};
@@ -14586,6 +14587,33 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
                 {
                     LOCK(cs_main);
                     m_matmul_attestation_requested.erase(hash);
+                    CBlockIndex* const index{
+                        m_chainman.m_blockman.LookupBlockIndex(hash)};
+                    // Run the subtree promotion once when quorum is formed.
+                    // A duplicate valid signature can also repair a datadir
+                    // written by an older build that stored quorum without
+                    // persisting block-index provenance. Do not let arbitrary
+                    // replays repeatedly traverse descendants or invoke ABC.
+                    const bool needs_promotion{
+                        result == matmul::trusted::AddResult::Accepted ||
+                        (index != nullptr &&
+                         (index->nStatus &
+                          BLOCK_TRUSTED_REPLAY_ATTESTED) == 0)};
+                    const bool promoted{
+                        needs_promotion &&
+                        m_chainman.PersistMatMulTrustedReplayAttestation(hash)};
+                    const bool activation_ready{
+                        promoted && index != nullptr &&
+                        (index->nStatus & BLOCK_HAVE_DATA) != 0 &&
+                        index->IsValid(BLOCK_VALID_TRANSACTIONS) &&
+                        index->HaveNumChainTxs()};
+                    retry_chain_activation =
+                        retry_chain_activation || activation_ready;
+                    if (activation_ready) {
+                        LogInfo("MMATTEST quorum promoted stored block=%s "
+                                "height=%d for best-chain activation\n",
+                                hash.ToString(), expected_height);
+                    }
                     // Body may have been HEADER_ONLY-dropped before quorum
                     // existed. Tip-move clears are unreachable if this hash
                     // is the followed tip-child that never connected. Allow
@@ -14599,9 +14627,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
                     // before its body arrives so the losing local tip cannot
                     // grow beyond the configured PARK depth while download
                     // and asynchronous verification are still pending.
-                    if (const CBlockIndex* index{
-                            m_chainman.m_blockman.LookupBlockIndex(hash)};
-                        index != nullptr &&
+                    if (index != nullptr &&
                         !m_chainman.MaybeTrackReorgRecovery(index)) {
                         // The attestation remains valid and available for
                         // retry; persistence failure must not misclassify the
@@ -14621,6 +14647,20 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
                 if (m_matmul_verify_worker) {
                     m_matmul_verify_worker->NotifyQuorumReady(hash);
                 }
+            }
+        }
+        if (retry_chain_activation) {
+            // A trusted body can be persisted before quorum and removed from
+            // setBlockIndexCandidates while ConnectTip waits. Quorum promotion
+            // restored it above; retry ordinary fork choice outside cs_main so
+            // the node does not wait for an unrelated future block delivery.
+            BlockValidationState activation_state;
+            const bool activated{
+                m_chainman.ActiveChainstate().ActivateBestChain(
+                    activation_state)};
+            if (!activated || activation_state.IsError()) {
+                LogError("Unable to activate best chain after MMATTEST quorum: %s\n",
+                         activation_state.ToString());
             }
         }
         // Attestation acceptance / quorum can newly unlock tip-extending bodies

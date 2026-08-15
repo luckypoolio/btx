@@ -12285,17 +12285,57 @@ bool ChainstateManager::PersistMatMulTrustedReplayAttestation(
     AssertLockHeld(::cs_main);
     CBlockIndex* index{m_blockman.LookupBlockIndex(block_hash)};
     if (index == nullptr || (index->nStatus & BLOCK_FAILED_MASK) ||
-        GetMatMulValidationMode() !=
-            kernel::MatMulValidationMode::TRUSTED ||
+        !node::matmul_trusted::IsConfigured() ||
+        (GetMatMulValidationMode() != kernel::MatMulValidationMode::TRUSTED &&
+         GetMatMulValidationMode() != kernel::MatMulValidationMode::CONSENSUS) ||
         !GetConsensus().IsMatMulTrustedReplayAttestationActive(
-            index->nHeight)) {
+            index->nHeight) ||
+        !node::matmul_trusted::HasQuorum(block_hash, index->nHeight)) {
         return false;
     }
-    index->nStatus |= BLOCK_TRUSTED_REPLAY_ATTESTED;
-    m_blockman.m_dirty_blockindex.insert(index);
-    // Deliberately do not populate the replay memo here. The worker populated
-    // its process-local memo only after verifying current-config signatures;
-    // this persistent audit bit must never recreate that authority.
+    if ((index->nStatus & BLOCK_TRUSTED_REPLAY_ATTESTED) == 0) {
+        index->nStatus |= BLOCK_TRUSTED_REPLAY_ATTESTED;
+        m_blockman.m_dirty_blockindex.insert(index);
+    }
+
+    auto reconsider = [this](CBlockIndex& candidate)
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+        AssertLockHeld(::cs_main);
+        if (candidate.nStatus & BLOCK_FAILED_MASK) return;
+        NoteAuthenticatedRecoveryCandidate(&candidate);
+        if ((candidate.nStatus & BLOCK_HAVE_DATA) != 0 &&
+            candidate.IsValid(BLOCK_VALID_TRANSACTIONS) &&
+            candidate.HaveNumChainTxs()) {
+            for (Chainstate* chainstate : GetAll()) {
+                chainstate->TryAddBlockIndexCandidate(&candidate);
+            }
+        }
+        if (m_best_header == nullptr ||
+            PreferTrustAdjustedHeader(*m_best_header, candidate)) {
+            SetBestHeader(&candidate);
+        }
+    };
+
+    // The body may have reached BLOCK_VALID_TRANSACTIONS before quorum. Its
+    // authenticated-work contribution was therefore zero and descendants
+    // inherited that stale total. Promote the complete subtree now, then put
+    // every connectable block back into the candidate set: FindMostWorkChain
+    // may have removed the branch while it was still unattested.
+    UpdateAuthenticatedChainWork(*index, GetConsensus());
+    reconsider(*index);
+    PropagateAuthenticatedChainWorkDescendants(
+        *index, GetConsensus(),
+        [this](CBlockIndex& parent,
+               const std::function<void(CBlockIndex&)>& visit)
+            EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+            AssertLockHeld(::cs_main);
+            m_blockman.ForEachBlockChild(parent, visit);
+        },
+        reconsider);
+
+    // Deliberately do not populate the replay memo here. Callers must continue
+    // to query current-config quorum; this persistent audit bit must never
+    // recreate authority by itself after restart or key rotation.
     return true;
 }
 
