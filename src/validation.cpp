@@ -1899,6 +1899,18 @@ template <typename Spend>
     return chainstate.m_blockman.ReadBlock(block, *fallback_pos, index.GetBlockHash());
 }
 
+[[nodiscard]] static bool ShieldedGapRecoveryCanSkipBlockBody(
+    const CBlockIndex& index)
+{
+    // CheckTransaction rejects a shielded bundle in coinbase. Therefore an
+    // accepted one-transaction block cannot change any shielded state. This
+    // lets bounded startup recovery repair a torn tip pin even when an
+    // unclean stop lost the recent block-file position from the block index.
+    // Any block that could contain a second transaction still requires its
+    // body and fails closed when the body is unavailable.
+    return index.nTx == 1;
+}
+
 [[nodiscard]] static bool ShieldedRebuildBlockAvailable(const Chainstate& chainstate,
                                                         const CBlockIndex& index)
     EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
@@ -1923,7 +1935,8 @@ template <typename Spend>
 
     const CBlockIndex* cursor = tip;
     for (int depth = 0; depth < SHIELDED_ANCHOR_DEPTH && cursor != nullptr; ++depth) {
-        if (!ShieldedRebuildBlockAvailable(chainstate, *cursor)) {
+        if (!ShieldedGapRecoveryCanSkipBlockBody(*cursor) &&
+            !ShieldedRebuildBlockAvailable(chainstate, *cursor)) {
             return false;
         }
         cursor = cursor->pprev;
@@ -1965,7 +1978,8 @@ template <typename Spend>
     for (const CBlockIndex* cursor = tip;
          cursor != nullptr && cursor->nHeight >= first_height;
          cursor = cursor->pprev) {
-        if (!ShieldedRebuildBlockAvailable(chainstate, *cursor)) {
+        if (!ShieldedGapRecoveryCanSkipBlockBody(*cursor) &&
+            !ShieldedRebuildBlockAvailable(chainstate, *cursor)) {
             error = strprintf("block unavailable at height=%d hash=%s",
                               cursor->nHeight,
                               cursor->GetBlockHash().ToString());
@@ -1977,6 +1991,12 @@ template <typename Spend>
 
     for (const CBlockIndex* pindex : chain) {
         if (!consensus.IsShieldedUnshieldVelocityCapActive(pindex->nHeight)) {
+            continue;
+        }
+        if (ShieldedGapRecoveryCanSkipBlockBody(*pindex)) {
+            velocity.RecordBlock(pindex->nHeight, 0);
+            velocity.Prune(pindex->nHeight -
+                2 * static_cast<int32_t>(consensus.nShieldedUnshieldVelocityWindowBlocks));
             continue;
         }
         CBlock block;
@@ -2104,6 +2124,12 @@ static void UpdateShieldedPruneRetentionLock(Chainstate& chainstate) EXCLUSIVE_L
 
     const CBlockIndex* cursor = tip;
     for (int depth = 0; depth < SHIELDED_ANCHOR_DEPTH && cursor != nullptr; ++depth) {
+        if (ShieldedGapRecoveryCanSkipBlockBody(*cursor)) {
+            const uint256 rebuilt_root = cursor_tree.Root();
+            if (!rebuilt_root.IsNull()) rebuilt_roots.push_back(rebuilt_root);
+            cursor = cursor->pprev;
+            continue;
+        }
         CBlock block;
         if (!ReadShieldedRebuildBlock(chainstate, *cursor, block)) {
             LogError("CollectShieldedAnchorHistoryFromTree: failed to read block %s\n",
@@ -2750,6 +2776,12 @@ enum class ShieldedChainDerivedRebuildParts : uint32_t {
     shielded::registry::ShieldedAccountRegistryState cursor_registry = current_registry;
     const CBlockIndex* cursor = tip;
     for (int depth = 0; depth < SHIELDED_ANCHOR_DEPTH && cursor != nullptr; ++depth) {
+        if (ShieldedGapRecoveryCanSkipBlockBody(*cursor)) {
+            const uint256 rebuilt_root = cursor_registry.Root();
+            if (!rebuilt_root.IsNull()) rebuilt_roots.push_back(rebuilt_root);
+            cursor = cursor->pprev;
+            continue;
+        }
         const bool use_nonced_bridge_tag =
             UseNoncedShieldedBridgeTags(chainstate.m_chainman.GetConsensus(), cursor->nHeight);
         CBlock block;
@@ -8741,6 +8773,24 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     view.SetBestBlock(pindex->GetBlockHash());
 
     if (apply_shielded_state && this == &m_chainman.ActiveChainstate() && m_chainman.m_shielded_state_initialized) {
+        // PersistShieldedState() durably advances the auxiliary state and
+        // clears its recovery marker before the coins view is normally synced.
+        // Flush the block, undo, and their index references first so an
+        // unclean stop can always reconcile that state from the older durable
+        // coins tip. Without this ordering, the shielded tip can survive while
+        // the corresponding CBlockIndex falls back to header-only.
+        if (!m_blockman.FlushChainstateBlockFile(
+                pindex->nHeight,
+                /*snapshot_chainstate=*/m_from_snapshot_blockhash.has_value())) {
+            return state.Error("shielded-state-block-dependency-flush-failed");
+        }
+        if (!m_blockman.WriteBlockIndexDB()) {
+            return state.Error("shielded-state-block-index-flush-failed");
+        }
+        if (m_chainman.InjectShieldedTransitionWriteFailureForTest(
+                ShieldedTransitionWriteSeam::BLOCK_DEPENDENCIES_DURABLE)) {
+            return state.Error("shielded-state-block-dependency-test-failure");
+        }
         m_chainman.RecordShieldedAnchorRoot(m_chainman.m_shielded_merkle_tree.Root());
         m_chainman.RecordShieldedAccountRegistryRoot(m_chainman.m_shielded_account_registry.Root());
         if (!m_chainman.PersistShieldedState(pindex)) {
@@ -17441,6 +17491,7 @@ bool ChainstateManager::EnsureShieldedStateInitialized()
 
             auto collect_forward_block =
                 [&](const CBlockIndex* pindex) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) -> bool {
+                if (ShieldedGapRecoveryCanSkipBlockBody(*pindex)) return true;
                 CBlock block;
                 if (!ReadShieldedRebuildBlock(*m_active_chainstate, *pindex, block)) return false;
                 std::set<uint256> created_anchors;
@@ -17486,6 +17537,7 @@ bool ChainstateManager::EnsureShieldedStateInitialized()
 
             auto collect_reverse_block =
                 [&](const CBlockIndex* pindex) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) -> bool {
+                if (ShieldedGapRecoveryCanSkipBlockBody(*pindex)) return true;
                 CBlock block;
                 CBlockUndo undo;
                 if (!ReadShieldedRebuildBlock(*m_active_chainstate, *pindex, block) ||
@@ -18561,6 +18613,7 @@ bool ChainstateManager::EnsureShieldedStateInitialized()
                 std::reverse(gap_path.begin(), gap_path.end());
                 for (const CBlockIndex* pindex : gap_path) {
                     if (!base_trusted) break;
+                    if (ShieldedGapRecoveryCanSkipBlockBody(*pindex)) continue;
                     CBlock block;
                     if (!ReadShieldedRebuildBlock(*m_active_chainstate, *pindex, block)) {
                         base_trusted = false;
@@ -18678,9 +18731,13 @@ bool ChainstateManager::EnsureShieldedStateInitialized()
                 for (const CBlockIndex* cursor = persisted_index;
                      base_trusted && cursor != tip;
                      cursor = cursor->pprev) {
+                    if (cursor == nullptr) {
+                        base_trusted = false;
+                        break;
+                    }
+                    if (ShieldedGapRecoveryCanSkipBlockBody(*cursor)) continue;
                     CBlock block;
-                    if (cursor == nullptr ||
-                        !ReadShieldedRebuildBlock(*m_active_chainstate, *cursor, block)) {
+                    if (!ReadShieldedRebuildBlock(*m_active_chainstate, *cursor, block)) {
                         base_trusted = false;
                         break;
                     }
@@ -18816,6 +18873,7 @@ bool ChainstateManager::EnsureShieldedStateInitialized()
                 for (const CBlockIndex* cursor = persisted_index;
                      base_trusted && cursor != transition_fork;
                      cursor = cursor->pprev) {
+                    if (ShieldedGapRecoveryCanSkipBlockBody(*cursor)) continue;
                     CBlock block;
                     if (!ReadShieldedRebuildBlock(*m_active_chainstate,
                                                   *cursor, block)) {
@@ -18873,6 +18931,7 @@ bool ChainstateManager::EnsureShieldedStateInitialized()
                 }
                 std::reverse(connect_path.begin(), connect_path.end());
                 for (const CBlockIndex* pindex : connect_path) {
+                    if (ShieldedGapRecoveryCanSkipBlockBody(*pindex)) continue;
                     CBlock block;
                     if (!ReadShieldedRebuildBlock(*m_active_chainstate,
                                                   *pindex, block)) {

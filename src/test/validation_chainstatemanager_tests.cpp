@@ -1084,7 +1084,8 @@ struct ShieldedWriteFaultPersistedTestChain100Setup : TestChain100Setup
     }
 
     void ExerciseWriteFailure(ShieldedTransitionWriteSeam seam,
-                              bool settlement_transaction = false)
+                              bool settlement_transaction = false,
+                              bool flush_candidate_before_activation = true)
     {
         ChainstateManager& chainman = *Assert(m_node.chainman);
         const auto script_pub_key = GetScriptForDestination(PKHash(coinbaseKey.GetPubKey()));
@@ -1102,6 +1103,11 @@ struct ShieldedWriteFaultPersistedTestChain100Setup : TestChain100Setup
         {
             LOCK(::cs_main);
             BOOST_REQUIRE(chainman.EnsureShieldedStateInitialized());
+            if (!flush_candidate_before_activation) {
+                // Leave the candidate body and index dirty so the production
+                // shielded dependency barrier is what makes them durable.
+                for (Chainstate* cs : chainman.GetAll()) cs->ForceFlushStateToDisk();
+            }
             BlockValidationState accept_state;
             bool new_block{false};
             BOOST_REQUIRE(chainman.AcceptBlock(std::make_shared<const CBlock>(block),
@@ -1114,9 +1120,11 @@ struct ShieldedWriteFaultPersistedTestChain100Setup : TestChain100Setup
             BOOST_REQUIRE(accept_state.IsValid());
             BOOST_REQUIRE(new_block);
             BOOST_REQUIRE(target_index != nullptr);
-            // Make the candidate body/index and the old committed state
-            // durable before modelling a process crash during ConnectBlock.
-            for (Chainstate* cs : chainman.GetAll()) cs->ForceFlushStateToDisk();
+            if (flush_candidate_before_activation) {
+                // Existing seam tests isolate auxiliary writes by making the
+                // candidate body/index and old committed state durable first.
+                for (Chainstate* cs : chainman.GetAll()) cs->ForceFlushStateToDisk();
+            }
         }
 
         bool injected{false};
@@ -1215,6 +1223,14 @@ SHIELDED_REBALANCE_WRITE_FAULT_TEST(shielded_write_failure_velocity_is_fatal_and
                                     UNSHIELD_VELOCITY)
 SHIELDED_REBALANCE_WRITE_FAULT_TEST(shielded_write_failure_pool_is_fatal_and_restart_safe,
                                     POOL_BALANCE)
+BOOST_FIXTURE_TEST_CASE(shielded_block_dependencies_are_durable_before_state_pin,
+                        ShieldedWriteFaultPersistedTestChain100Setup)
+{
+    ExerciseWriteFailure(
+        ShieldedTransitionWriteSeam::BLOCK_DEPENDENCIES_DURABLE,
+        /*settlement_transaction=*/false,
+        /*flush_candidate_before_activation=*/false);
+}
 SHIELDED_REBALANCE_WRITE_FAULT_TEST(shielded_write_failure_final_state_is_fatal_and_restart_safe,
                                     PERSISTED_STATE)
 SHIELDED_REBALANCE_WRITE_FAULT_TEST(shielded_write_failure_accumulator_is_fatal_and_restart_safe,
@@ -3977,6 +3993,13 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_gap_only_unwinds_persisted_shielded_de
     this->LoadVerifyActivateChainstate();
     {
         LOCK(::cs_main);
+        CBlockIndex* ahead = restarted.m_blockman.LookupBlockIndex(ahead_tip_hash);
+        BOOST_REQUIRE(ahead != nullptr);
+        BOOST_REQUIRE_EQUAL(ahead->nTx, 1U);
+        ahead->nStatus &= ~BLOCK_HAVE_DATA;
+        ahead->nDataPos = 0;
+        ahead->nFile = -1;
+
         ASSERT_DEBUG_LOG("completed gap-only shielded unwind of 1 block(s)");
         BOOST_REQUIRE(restarted.EnsureShieldedStateInitialized());
         BOOST_CHECK(!restarted.ReadShieldedMutationMarker().has_value());
@@ -4066,6 +4089,10 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_refuses_genesis_rebuild_wipe_when_ahea
         ahead->nStatus &= ~BLOCK_HAVE_DATA;
         ahead->nDataPos = 0;
         ahead->nFile = -1;
+        // A second transaction could carry shielded effects, so missing this
+        // body must still reject startup recovery. The one-transaction case
+        // is covered by chainstatemanager_gap_only_unwinds_* above.
+        ahead->nTx = 2;
         CBlockIndex* pruned = restarted.ActiveChain()[10];
         BOOST_REQUIRE(pruned != nullptr);
         pruned->nStatus &= ~BLOCK_HAVE_DATA;
@@ -4176,6 +4203,18 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_gap_only_recovers_persisted_shielded_s
     this->LoadVerifyActivateChainstate();
     {
         LOCK(::cs_main);
+        CBlockIndex* persisted = restarted.m_blockman.LookupBlockIndex(old_tip_hash);
+        CBlockIndex* active = restarted.m_blockman.LookupBlockIndex(expected_tip_hash);
+        BOOST_REQUIRE(persisted != nullptr);
+        BOOST_REQUIRE(active != nullptr);
+        BOOST_REQUIRE_EQUAL(persisted->nTx, 1U);
+        BOOST_REQUIRE_EQUAL(active->nTx, 1U);
+        for (CBlockIndex* index : {persisted, active}) {
+            index->nStatus &= ~BLOCK_HAVE_DATA;
+            index->nDataPos = 0;
+            index->nFile = -1;
+        }
+
         ASSERT_DEBUG_LOG(
             "completed gap-only shielded short-reorg transition (disconnect=1 connect=1)");
         BOOST_REQUIRE(restarted.EnsureShieldedStateInitialized());
