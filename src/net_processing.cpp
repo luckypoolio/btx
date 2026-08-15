@@ -15974,16 +15974,23 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
             const bool may_claim_initial_sync_slot{
                 nSyncStarted == 0 && sync_blocks_and_headers_from_peer};
             if (may_claim_initial_sync_slot || near_tip_headers) {
-                const CBlockIndex* pindexStart = m_chainman.m_best_header;
-                /* If possible, start at the block preceding the currently
-                   best known header.  This ensures that we always get a
-                   non-empty list of headers back as long as the peer
-                   is up-to-date.  With a non-empty response, we can initialise
-                   the peer's known best block.  This wouldn't be possible
-                   if we requested starting at m_chainman.m_best_header and
-                   got back an empty response.  */
-                if (pindexStart->pprev)
+                const CBlockIndex* active_tip{m_chainman.ActiveChain().Tip()};
+                const bool peer_behind_header_frontier{
+                    active_tip != nullptr &&
+                    peer->m_starting_height > active_tip->nHeight &&
+                    peer->m_starting_height < m_chainman.m_best_header->nHeight};
+                const CBlockIndex* pindexStart{
+                    peer_behind_header_frontier ? active_tip
+                                                : m_chainman.m_best_header};
+                /* An archive peer can be ahead of our validated tip while
+                   behind a headers-only frontier learned from another peer.
+                   Probe that peer from the active tip so its response cannot
+                   be empty merely because it already knows the newer headers
+                   as a side branch. Up-to-date peers still start one header
+                   back to initialize their known-best pointer. */
+                if (!peer_behind_header_frontier && pindexStart->pprev) {
                     pindexStart = pindexStart->pprev;
+                }
                 if (MaybeSendGetHeaders(*pto, GetLocator(pindexStart), *peer)) {
                     LogDebug(BCLog::NET, "initial getheaders (%d) to peer=%d (startheight:%d)\n", pindexStart->nHeight, pto->GetId(), peer->m_starting_height);
 
@@ -16034,8 +16041,12 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                 auto& last_probe{m_best_known_probe_at[pto->GetId()]};
                 if (last_probe.count() == 0 ||
                     current_time - last_probe > BEST_KNOWN_PROBE_INTERVAL) {
-                    const CBlockIndex* start{m_chainman.m_best_header};
-                    if (start != nullptr && start->pprev) start = start->pprev;
+                    // pindexBestKnownBlock is still null, so probing from a
+                    // newer headers-only frontier may yield another empty
+                    // response from a useful but slightly older archive peer.
+                    // The active tip is validated and guarantees forward
+                    // headers whenever the advertised height is truthful.
+                    const CBlockIndex* start{tip};
                     if (start != nullptr &&
                         MaybeSendGetHeaders(*pto, GetLocator(start), *peer)) {
                         last_probe = current_time;
