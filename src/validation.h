@@ -1605,6 +1605,11 @@ public:
      * equivocations remain ambiguous. Live 2026-08-15: old dual-attested
      * siblings stranded trusted mirrors behind a longer signed frontier and
      * later made them alternate between recent branches.
+     *
+     * Also return the unique attested HAVE_DATA suffix child of that tip
+     * (LCA depth 0, height > tip). That is catch-up, not a reorg: the
+     * signed frontier ran ahead while this node still sat on the attested
+     * parent (live 2026-08-15: tip 189675, attested HAVE_DATA 189676).
      */
     const CBlockIndex* FindUniqueCompetingAttestedIndex() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     bool IsAttestedAbandonForkCandidate(const CBlockIndex* candidate) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
