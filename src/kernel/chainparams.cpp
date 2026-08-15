@@ -962,6 +962,12 @@ public:
                 // blocks behind the tip, far beyond nMaxReorgDepth, so it
                 // cannot pin a block that might still legitimately reorg.
                 {186000, uint256{"0a51fccfd75d2051e94be1a8cc5abff8b86ac53d0cc134680f286fe769aa2129"}},
+                // Canonical child at the live 187661 network split. The
+                // retired 189307 snapshot was built on the lower-work sibling
+                // (ad62b638...), so a post-split checkpoint is required to
+                // keep fresh nodes and future snapshots on the signed,
+                // higher-work branch.
+                {187661, uint256{"2d85ef534ab6ae21c5981d85b38bbbc9daf4e402b084774bdbf65a967474aad1"}},
             }
         };
         m_assumeutxo_data = {
@@ -1120,14 +1126,6 @@ public:
                 .m_chain_tx_count = 274'878,
                 .blockhash = consteval_ctor(uint256{"2dd1d545b1b5e76c28b4414ebe0c22b1ba9d3ebd88662fbd1b9e4d0cf6693933"}),
                 .shielded_state_commitment = uint256{"74a131a91f71cb7e488c1826eb3d5676802a586bddb8082b33356568d7def0b5"},
-            },
-            {
-                // main assumeutxo snapshot at height 189'307 (snapshot v9)
-                .height = 189'307,
-                .hash_serialized = AssumeutxoHash{uint256{"48da3da953130984036435da93847ebe7d1a20fc5464d789b07f49b79178e074"}},
-                .m_chain_tx_count = 287'404,
-                .blockhash = consteval_ctor(uint256{"bd8c44a30103613a34ac271b7cfffb4334b70aae9c41cf12831d98a98313e6c8"}),
-                .shielded_state_commitment = uint256{"94343b766b39c0ea2d92d83323f77b5ccc5e775d99b34b01f5fa6400f2354541"},
             },
         };
         chainTxData = ChainTxData{
