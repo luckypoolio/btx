@@ -1598,11 +1598,12 @@ public:
      * — do not disconnect it) or if two incomparable attested branches exist.
      *
      * When the active tip already has quorum: still return the strictly
-     * greatest-work competing attested HAVE_DATA short-reorg frontier
-     * (every frontier hint at a height, not last-writer). Lower-work stale
-     * siblings do not mask it; incomparable equal-work candidates remain
-     * ambiguous. Live 2026-08-15: old dual-attested siblings stranded
-     * trusted mirrors behind a longer signed frontier.
+     * greater-work competing attested HAVE_DATA short-reorg frontier (every
+     * frontier hint at a height, not last-writer). Lower-work stale siblings
+     * do not mask a longer frontier or rewind the active tip; equal-work
+     * equivocations remain ambiguous. Live 2026-08-15: old dual-attested
+     * siblings stranded trusted mirrors behind a longer signed frontier and
+     * later made them alternate between recent branches.
      */
     const CBlockIndex* FindUniqueCompetingAttestedIndex() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     bool IsAttestedAbandonForkCandidate(const CBlockIndex* candidate) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);

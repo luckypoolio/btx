@@ -1810,12 +1810,11 @@ BOOST_FIXTURE_TEST_CASE(chainstate_retryable_matmul_error_does_not_spin_activate
     chainman.CheckBlockIndex();
 }
 
-BOOST_FIXTURE_TEST_CASE(chainstate_dual_quorum_sibling_follows_signed_frontier, TestChain100Setup)
+BOOST_FIXTURE_TEST_CASE(chainstate_dual_quorum_equal_work_fails_closed, TestChain100Setup)
 {
-    // Live 2026-08-15: signer attested both 189489 siblings; trusted
-    // mirrors connected the loser (it had quorum) and then refused to
-    // reorg because FindUniqueCompetingAttestedIndex bailed on a quorum
-    // tip. The signed frontier's short-reorg fork-child must still win.
+    // A signer attesting both equal-work siblings has not identified a
+    // canonical winner. Stay on the authenticated active tip until one
+    // branch gains a greater-work attested descendant.
     ChainstateManager& chainman = *Assert(m_node.chainman);
     Chainstate& chainstate = chainman.ActiveChainstate();
     auto& consensus = const_cast<Consensus::Params&>(Params().GetConsensus());
@@ -1885,9 +1884,8 @@ BOOST_FIXTURE_TEST_CASE(chainstate_dual_quorum_sibling_follows_signed_frontier, 
     BOOST_REQUIRE(node::matmul_trusted::Configure(
         std::move(config), /*trusted_mirror=*/true, /*serve=*/false,
         std::chrono::milliseconds{50}, error));
-    // Sign the competing sibling first, then the connected loser, so the
-    // last-writer frontier hint is the on-chain hash. Recovery must still
-    // find the sibling (live 2026-08-15 last-writer hole).
+    // Sign both siblings in either order. Last-writer ordering must not turn
+    // an authority equivocation into an arbitrary reorg.
     BOOST_REQUIRE(node::matmul_trusted::SignAuthoritative(
                       sibling->GetBlockHash(), sibling->nHeight) ==
                   matmul::trusted::AddResult::Accepted);
@@ -1902,13 +1900,13 @@ BOOST_FIXTURE_TEST_CASE(chainstate_dual_quorum_sibling_follows_signed_frontier, 
             original_hash, original_tip->nHeight));
         BOOST_REQUIRE(node::matmul_trusted::HasQuorum(
             sibling->GetBlockHash(), sibling->nHeight));
-        BOOST_CHECK_EQUAL(chainman.FindUniqueCompetingAttestedIndex(), sibling);
-        BOOST_CHECK(chainman.IsAttestedAbandonForkCandidate(sibling));
+        BOOST_CHECK(chainman.FindUniqueCompetingAttestedIndex() == nullptr);
+        BOOST_CHECK(!chainman.IsAttestedAbandonForkCandidate(sibling));
     }
 
     state = BlockValidationState{};
     BOOST_REQUIRE(chainstate.ActivateBestChain(state));
-    BOOST_REQUIRE(WITH_LOCK(::cs_main, return chainstate.m_chain.Tip()) == sibling);
+    BOOST_REQUIRE(WITH_LOCK(::cs_main, return chainstate.m_chain.Tip()) == original_tip);
 }
 
 BOOST_FIXTURE_TEST_CASE(chainstate_shorter_attested_sibling_does_not_mask_longer_frontier, TestChain100Setup)
@@ -2064,6 +2062,16 @@ BOOST_FIXTURE_TEST_CASE(chainstate_shorter_attested_sibling_does_not_mask_longer
         BOOST_CHECK(chainman.IsAttestedAbandonForkCandidate(frontier_tip));
     }
 
+    state = BlockValidationState{};
+    BOOST_REQUIRE(chainstate.ActivateBestChain(state));
+    BOOST_REQUIRE(WITH_LOCK(::cs_main, return chainstate.m_chain.Tip()) == frontier_tip);
+
+    {
+        LOCK(::cs_main);
+        BOOST_REQUIRE(stale_sibling->nChainWork < frontier_tip->nChainWork);
+        BOOST_CHECK(chainman.FindUniqueCompetingAttestedIndex() == nullptr);
+        BOOST_CHECK(!chainman.IsAttestedAbandonForkCandidate(stale_sibling));
+    }
     state = BlockValidationState{};
     BOOST_REQUIRE(chainstate.ActivateBestChain(state));
     BOOST_REQUIRE(WITH_LOCK(::cs_main, return chainstate.m_chain.Tip()) == frontier_tip);

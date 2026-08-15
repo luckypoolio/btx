@@ -195,9 +195,9 @@ static constexpr int TRUSTED_MIRROR_ATTESTED_TIP_LOOKBACK{2};
  *  race. Competing then extended as "tip-extending" to 18781x.
  *
  *  Dual-attested same-height siblings (live 2026-08-15: both 189489
- *  hashes signed, mirrors stranded on the loser) are recovered by
- *  FindUniqueCompetingAttestedIndex following the signed frontier, not
- *  by this gate.
+ *  hashes signed) remain ambiguous while equal-work. Once one branch has
+ *  a greater-work attested descendant, FindUniqueCompetingAttestedIndex
+ *  follows that frontier; lower-work siblings cannot pull it backward.
  *
  *  A node already sitting on an unattested tip (equal-work lost sibling
  *  or heavier unattested fork) is recovered by

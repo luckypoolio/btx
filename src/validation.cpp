@@ -11069,6 +11069,14 @@ const CBlockIndex* ChainstateManager::FindUniqueCompetingAttestedIndex() const
             return nullptr;
         }
     }
+    // A quorum active tip is already an authenticated candidate. Competing
+    // attestations can replace it only by proving strictly greater work.
+    // Equal-work equivocations have no authenticated winner, while lower-work
+    // historical siblings must never rewind the node. This also prevents ABC
+    // from alternating between old dual-attested branches on each invocation.
+    if (tip_has_quorum && unique->nChainWork <= tip->nChainWork) {
+        return nullptr;
+    }
     if (tip_has_quorum) {
         const CBlockIndex* const lca{LastCommonAncestor(tip, unique)};
         if (lca == nullptr) return nullptr;
