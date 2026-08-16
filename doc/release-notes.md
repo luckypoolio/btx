@@ -55,10 +55,10 @@ foreground catch-up to the remaining blocks after that height. Strict
 consensus nodes must use this `loadtxoutset` pin rather than attested
 snapshots. The node keeps validating the historical chain in the background.
 The previous 190467 and 179000 pins remain in `m_assumeutxo_data`. The 189307
-snapshot is retired because its base descends from the lower-work sibling at
-the height-187661 network split. This release checkpoints the signed,
-higher-work child at height 187661 so a fresh node cannot silently bootstrap
-onto that retired branch.
+snapshot and current attestation/archive fleet identify `ad62b638...` as the
+canonical child at the height-187661 network split. This release checkpoints
+that child so fresh and recovering nodes converge on the published snapshot's
+ancestry.
 
 # Notable Changes
 

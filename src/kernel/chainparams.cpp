@@ -962,12 +962,10 @@ public:
                 // blocks behind the tip, far beyond nMaxReorgDepth, so it
                 // cannot pin a block that might still legitimately reorg.
                 {186000, uint256{"0a51fccfd75d2051e94be1a8cc5abff8b86ac53d0cc134680f286fe769aa2129"}},
-                // Canonical child at the live 187661 network split. The
-                // retired 189307 snapshot was built on the lower-work sibling
-                // (ad62b638...), so a post-split checkpoint is required to
-                // keep fresh nodes and future snapshots on the signed,
-                // higher-work branch.
-                {187661, uint256{"2d85ef534ab6ae21c5981d85b38bbbc9daf4e402b084774bdbf65a967474aad1"}},
+                // Canonical child at the live 187661 network split. This is
+                // the ancestor committed by the published 189307 snapshot and
+                // followed by the current attestation/archive fleet.
+                {187661, uint256{"ad62b638c0ac1b15870bfd8fa949c8d154e9d0dc27c99b64c740f315870120ac"}},
             }
         };
         m_assumeutxo_data = {

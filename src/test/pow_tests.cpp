@@ -2396,7 +2396,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_hardening_anchor_consistency)
     BOOST_REQUIRE(it_187661 != checkpoints.end());
     BOOST_CHECK_EQUAL(
         it_187661->second.GetHex(),
-        "2d85ef534ab6ae21c5981d85b38bbbc9daf4e402b084774bdbf65a967474aad1");
+        "ad62b638c0ac1b15870bfd8fa949c8d154e9d0dc27c99b64c740f315870120ac");
     BOOST_CHECK_EQUAL(std::prev(checkpoints.end())->first, 187661);
 
     const auto assumeutxo_55000 = params->AssumeutxoForHeight(55000);
