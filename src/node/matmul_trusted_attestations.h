@@ -85,7 +85,12 @@ VerifyUtxoSnapshotManifest(
     const matmul::trusted::UtxoSnapshotManifest& manifest);
 [[nodiscard]] std::optional<uint256> ChainId();
 [[nodiscard]] bool HasQuorum(const uint256& block_hash, int32_t block_height);
-/** True when a different hash at this height already has quorum (hints). */
+/** In-memory store only. FindMostWorkChain must not durable-read+verify
+ *  every candidate under cs_main (live archive RPC wedge: ~45s/ABC). */
+[[nodiscard]] bool HasQuorumInMemory(const uint256& block_hash,
+                                     int32_t block_height);
+/** True when a different hash at this height already has in-memory quorum
+ *  (frontier hints). Must not durable-read under cs_main. */
 [[nodiscard]] bool HasCompetingQuorum(const uint256& block_hash,
                                       int32_t block_height);
 /**
@@ -178,26 +183,82 @@ static constexpr int TRUSTED_MIRROR_ATTESTED_TIP_LOOKBACK{2};
     return lca_depth > 0 && lca_depth <= TRUSTED_MIRROR_SHORT_REORG_DEPTH;
 }
 
+/** FindUniqueCompetingAttestedIndex adoption gate.
+ *
+ *  Catch-up suffix of the active tip (LCA depth 0, idx above tip) is
+ *  always eligible. Competing forks are short-reorg only (depth 1–6).
+ *  The previous `tip_has_quorum == false` path had no depth bound, so a
+ *  fossil MMATTEST (signer ~1 behind the tip is the normal case) could
+ *  hijack FMWC into a 510-block rollback and starve the attested
+ *  HAVE_DATA tip-child (PR 105 field report 2026-08-15). Deep attested
+ *  recovery stays on the park / MaybeTrackReorgRecovery path. */
+[[nodiscard]] inline bool TrustedMirrorMayAdoptCompetingAttestedIndex(
+    bool attested_suffix_of_active_tip,
+    int lca_depth)
+{
+    return attested_suffix_of_active_tip ||
+           TrustedMirrorIsShortTipReorg(lca_depth);
+}
+
+/** True when `index` is a strict descendant of the active tip (catch-up
+ *  suffix). Same-height twins are not this: GetAncestor(tip) is the twin
+ *  itself. The 1879xx competing fork is not this either. Immediate
+ *  tip-children (`index_height == tip_height + 1`) also match; those
+ *  competing siblings stay HEADER_ONLY except the claimed/followed child. */
+[[nodiscard]] inline bool TrustedMirrorIndexExtendsActiveTip(
+    bool has_tip,
+    bool has_index,
+    int32_t index_height,
+    int32_t tip_height,
+    bool index_ancestor_at_tip_is_tip)
+{
+    return has_tip && has_index && index_height > tip_height &&
+           index_ancestor_at_tip_is_tip;
+}
+
+/** Catch-up suffix beyond the immediate tip-child (grandchildren+).
+ *  Trusted mirrors must persist / re-getdata these; HEADER_ONLY-skipping
+ *  them wedges FindMostWorkChain because the tip cannot move. Immediate
+ *  competing siblings are not this. */
+[[nodiscard]] inline bool TrustedMirrorIndexIsCatchUpSuffix(
+    bool has_tip,
+    bool has_index,
+    int32_t index_height,
+    int32_t tip_height,
+    bool index_ancestor_at_tip_is_tip)
+{
+    return TrustedMirrorIndexExtendsActiveTip(
+               has_tip, has_index, index_height, tip_height,
+               index_ancestor_at_tip_is_tip) &&
+           index_height > tip_height + 1;
+}
+
 /** FindMostWorkChain / candidate-set gate for any node that tracks a
  *  configured attestation quorum (trusted mirror, local signer, or
  *  consensus + -matmultrustedpubkey).
  *
- *  Tip-extending HAVE_DATA must always remain selectable: that is how the
- *  node catches up after a short reorg once the new parent is the tip.
- *  Selection is not the connect gate: TrustedMirrorMustDeferUnattestedConnect
- *  still refuses ConnectTip of an unattested Profile-1 block on a trusted
- *  mirror. A short attested tip-race (LCA depth 1–6 with quorum) may replace
- *  an *unattested* tip so a lost same-height sibling can converge.
+ *  Immediate unattested tip-children stay selectable (HAVE_DATA
+ *  chicken-egg). Unattested grandchildren / pre-built towers are not:
+ *  once the signer connected the wrong twin, the tower became
+ *  "tip-extending" and was attested as a stack (live 2026-08-15 190354
+ *  and the 67-block 190333–190400 fork). Selection is not the connect
+ *  gate: TrustedMirrorMustDeferUnattestedConnect still refuses ConnectTip
+ *  of an unattested Profile-1 block on a trusted mirror. A short attested
+ *  tip-race (LCA depth 1–6 with quorum) may replace an *unattested* tip so
+ *  a lost same-height sibling can converge.
  *
  *  Never reorg away a tip that already has quorum via this gate. Live
  *  2026-08-13: the signer followed a heavier 4-block competing fork at
  *  187795, signed it, and every mirror treated that as an attested short
  *  race. Competing then extended as "tip-extending" to 18781x.
  *
- *  Dual-attested same-height siblings (live 2026-08-15: both 189489
- *  hashes signed) remain ambiguous while equal-work. Once one branch has
- *  a greater-work attested descendant, FindUniqueCompetingAttestedIndex
- *  follows that frontier; lower-work siblings cannot pull it backward.
+ *  Never select an unattested candidate that would disconnect a quorum
+ *  ancestor, or that shares a height with a different already-attested
+ *  hash (dual-attest mint). Dual-attested same-height siblings (legacy:
+ *  both 189489 hashes signed) are recovered by
+ *  FindUniqueCompetingAttestedIndex following a strictly greater-work
+ *  signed frontier, not by this gate. Equal-work siblings remain ambiguous,
+ *  and lower-work siblings cannot pull the active chain backward.
  *
  *  A node already sitting on an unattested tip (equal-work lost sibling
  *  or heavier unattested fork) is recovered by
@@ -206,9 +267,16 @@ static constexpr int TRUSTED_MIRROR_ATTESTED_TIP_LOOKBACK{2};
     bool extends_active_tip_chain,
     bool short_tip_reorg,
     bool has_quorum,
-    bool active_tip_has_quorum = false)
+    bool active_tip_has_quorum = false,
+    bool immediate_tip_child = true,
+    bool would_abandon_attested = false,
+    bool competing_attested_height = false)
 {
-    if (extends_active_tip_chain) return true;
+    if (would_abandon_attested && !has_quorum) return false;
+    if (competing_attested_height && !has_quorum) return false;
+    if (extends_active_tip_chain) {
+        return has_quorum || immediate_tip_child;
+    }
     if (active_tip_has_quorum) return false;
     return short_tip_reorg && has_quorum;
 }
@@ -223,6 +291,16 @@ static constexpr int TRUSTED_MIRROR_ATTESTED_TIP_LOOKBACK{2};
     bool has_quorum)
 {
     return trusted_mirror_profile1 && !has_quorum;
+}
+
+/** CONSENSUS signer / configured node: never ConnectTip an unattested
+ *  hash at a height that already has quorum on a different hash. */
+[[nodiscard]] inline bool MustDeferConflictingAttestedHeight(
+    bool configured,
+    bool candidate_has_quorum,
+    bool competing_attested_height)
+{
+    return configured && !candidate_has_quorum && competing_attested_height;
 }
 
 /** True when an alternate index may defer an unattested most-work candidate.
@@ -311,19 +389,22 @@ static constexpr int TRUSTED_MIRROR_ATTESTED_TIP_LOOKBACK{2};
            recent_active_ancestor;
 }
 
-/** GETMMATTEST destinations. NODE_MATMUL_ATTESTATION_ARCHIVE is the signer.
- *  Trusted mirrors cache-and-forward signatures they have already accepted
- *  (they cannot SignAuthoritative). A recent valid MMATTEST is the same
- *  proof after the fact. Ordinary miners and nodes with no services still
- *  skip — they have no store. Direct signer addnode must not be required
- *  for functional mining. */
+/** GETMMATTEST destinations. NODE_MATMUL_ATTESTATION_ARCHIVE means the
+ *  peer answers GETMMATTEST (signer that still serves, or a trusted
+ *  mirror cache-and-forwarding accepted signatures). Trusted mirrors
+ *  cannot SignAuthoritative. Consensus nodes that still serve are a
+ *  fallback; a signer with -matmulattestationserve=0 keeps CONSENSUS
+ *  but replies not_serving without taking cs_main. Ordinary miners
+ *  with no CONSENSUS / ARCHIVE / MIRROR bit still skip. Direct signer
+ *  addnode must not be required. */
 [[nodiscard]] inline bool PreferGetMmAttestPeer(
     bool has_attestation_archive_bit,
     bool recent_valid_mmattest,
-    bool trusted_mirror = false)
+    bool trusted_mirror = false,
+    bool consensus_node = false)
 {
     return has_attestation_archive_bit || recent_valid_mmattest ||
-           trusted_mirror;
+           trusted_mirror || consensus_node;
 }
 
 struct AttestedFrontierHint {

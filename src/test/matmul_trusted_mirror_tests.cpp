@@ -140,6 +140,8 @@ BOOST_AUTO_TEST_CASE(valid_quorum_and_config_rotation_fail_closed)
         /*serve=*/false, std::chrono::milliseconds{20},
         error));
     BOOST_CHECK(node::matmul_trusted::IsTrustedMirror());
+    BOOST_CHECK(!node::matmul_trusted::ServesAttestations());
+    BOOST_CHECK(!node::matmul_trusted::HasLocalSigner());
     BOOST_CHECK_EQUAL(node::matmul_trusted::Threshold(), 2U);
     BOOST_REQUIRE(node::matmul_trusted::ReplayAuthorityContext());
     BOOST_CHECK(*node::matmul_trusted::ReplayAuthorityContext() == Hex256('a'));
@@ -191,6 +193,25 @@ BOOST_AUTO_TEST_CASE(valid_quorum_and_config_rotation_fail_closed)
                 matmul::trusted::WaitResult::Timeout);
 }
 
+BOOST_AUTO_TEST_CASE(trusted_mirror_may_serve_cached_attestations)
+{
+    RuntimeReset reset;
+    const CKey signer{NewKey()};
+    matmul::trusted::StoreConfig config;
+    config.chain_id = Hex256('1');
+    config.replay_authority_context = Hex256('a');
+    config.trusted_signers = {signer.GetPubKey()};
+    config.threshold = 1;
+    std::string error;
+    BOOST_REQUIRE(node::matmul_trusted::Configure(
+        std::move(config), /*trusted_mirror=*/true,
+        /*serve=*/true, std::chrono::milliseconds{20},
+        error));
+    BOOST_CHECK(node::matmul_trusted::IsTrustedMirror());
+    BOOST_CHECK(node::matmul_trusted::ServesAttestations());
+    BOOST_CHECK(!node::matmul_trusted::HasLocalSigner());
+}
+
 BOOST_AUTO_TEST_CASE(local_signer_and_expected_context)
 {
     RuntimeReset reset;
@@ -214,6 +235,8 @@ BOOST_AUTO_TEST_CASE(local_signer_and_expected_context)
                 matmul::trusted::AddResult::Accepted);
     BOOST_CHECK(produced.statement.replay_authority_context == Hex256('b'));
     BOOST_CHECK(node::matmul_trusted::HasQuorum(block, 9));
+    BOOST_CHECK(node::matmul_trusted::SignAuthoritative(Hex256('5'), 9) ==
+                matmul::trusted::AddResult::HeightOccupied);
     BOOST_CHECK(node::matmul_trusted::Add(
                     produced, block, 10) ==
                 matmul::trusted::AddResult::WrongHeight);
@@ -656,6 +679,19 @@ BOOST_AUTO_TEST_CASE(above_frontier_and_parked_branch_do_not_admit)
     BOOST_CHECK(TrustedMirrorIsShortTipReorg(6));
     BOOST_CHECK(!TrustedMirrorIsShortTipReorg(7));
     BOOST_CHECK(!TrustedMirrorIsShortTipReorg(187975 - 187773));
+    using node::matmul_trusted::TrustedMirrorIndexExtendsActiveTip;
+    using node::matmul_trusted::TrustedMirrorIndexIsCatchUpSuffix;
+    BOOST_CHECK(!TrustedMirrorIndexExtendsActiveTip(
+        /*has_tip=*/false, /*has_index=*/true, 2, 1, true));
+    BOOST_CHECK(!TrustedMirrorIndexExtendsActiveTip(
+        true, true, /*index_height=*/100, /*tip_height=*/100, true));
+    BOOST_CHECK(!TrustedMirrorIndexExtendsActiveTip(
+        true, true, 101, 100, /*index_ancestor_at_tip_is_tip=*/false));
+    BOOST_CHECK(TrustedMirrorIndexExtendsActiveTip(true, true, 101, 100, true));
+    BOOST_CHECK(TrustedMirrorIndexExtendsActiveTip(true, true, 102, 100, true));
+    BOOST_CHECK(!TrustedMirrorIndexIsCatchUpSuffix(true, true, 101, 100, true));
+    BOOST_CHECK(TrustedMirrorIndexIsCatchUpSuffix(true, true, 102, 100, true));
+    BOOST_CHECK(!TrustedMirrorIndexIsCatchUpSuffix(true, true, 102, 100, false));
     using node::matmul_trusted::TrustedMirrorMaySelectMostWorkCandidate;
     BOOST_CHECK(TrustedMirrorMaySelectMostWorkCandidate(
         /*extends_active_tip_chain=*/true, /*short_tip_reorg=*/false,
@@ -679,6 +715,23 @@ BOOST_AUTO_TEST_CASE(above_frontier_and_parked_branch_do_not_admit)
     BOOST_CHECK(TrustedMirrorMaySelectMostWorkCandidate(
         /*extends_active_tip_chain=*/true, /*short_tip_reorg=*/false,
         /*has_quorum=*/false, /*active_tip_has_quorum=*/true));
+    BOOST_CHECK(!TrustedMirrorMaySelectMostWorkCandidate(
+        /*extends_active_tip_chain=*/true, /*short_tip_reorg=*/false,
+        /*has_quorum=*/false, /*active_tip_has_quorum=*/true,
+        /*immediate_tip_child=*/false));
+    BOOST_CHECK(TrustedMirrorMaySelectMostWorkCandidate(
+        /*extends_active_tip_chain=*/true, /*short_tip_reorg=*/false,
+        /*has_quorum=*/true, /*active_tip_has_quorum=*/true,
+        /*immediate_tip_child=*/false));
+    BOOST_CHECK(!TrustedMirrorMaySelectMostWorkCandidate(
+        /*extends_active_tip_chain=*/true, /*short_tip_reorg=*/false,
+        /*has_quorum=*/false, /*active_tip_has_quorum=*/true,
+        /*immediate_tip_child=*/true, /*would_abandon_attested=*/true));
+    BOOST_CHECK(!TrustedMirrorMaySelectMostWorkCandidate(
+        /*extends_active_tip_chain=*/true, /*short_tip_reorg=*/false,
+        /*has_quorum=*/false, /*active_tip_has_quorum=*/true,
+        /*immediate_tip_child=*/true, /*would_abandon_attested=*/false,
+        /*competing_attested_height=*/true));
     using node::matmul_trusted::TrustedMirrorMustDeferUnattestedConnect;
     BOOST_CHECK(TrustedMirrorMustDeferUnattestedConnect(
         /*trusted_mirror_profile1=*/true, /*has_quorum=*/false));
@@ -688,6 +741,16 @@ BOOST_AUTO_TEST_CASE(above_frontier_and_parked_branch_do_not_admit)
         /*trusted_mirror_profile1=*/false, /*has_quorum=*/false));
     BOOST_CHECK(!TrustedMirrorMustDeferUnattestedConnect(
         /*trusted_mirror_profile1=*/false, /*has_quorum=*/true));
+    using node::matmul_trusted::MustDeferConflictingAttestedHeight;
+    BOOST_CHECK(MustDeferConflictingAttestedHeight(
+        /*configured=*/true, /*candidate_has_quorum=*/false,
+        /*competing_attested_height=*/true));
+    BOOST_CHECK(!MustDeferConflictingAttestedHeight(
+        /*configured=*/true, /*candidate_has_quorum=*/true,
+        /*competing_attested_height=*/true));
+    BOOST_CHECK(!MustDeferConflictingAttestedHeight(
+        /*configured=*/true, /*candidate_has_quorum=*/false,
+        /*competing_attested_height=*/false));
     using node::matmul_trusted::TrustedMirrorAttestedSiblingIsActionable;
     // Qualifier 3ed2619c: the attested tip / self candidate must not defer
     // a sole linear tip-child.
@@ -760,9 +823,27 @@ BOOST_AUTO_TEST_CASE(above_frontier_and_parked_branch_do_not_admit)
     BOOST_CHECK(PreferGetMmAttestPeer(
         /*has_attestation_archive_bit=*/false, /*recent_valid_mmattest=*/false,
         /*trusted_mirror=*/true));
+    BOOST_CHECK(PreferGetMmAttestPeer(
+        /*has_attestation_archive_bit=*/false, /*recent_valid_mmattest=*/false,
+        /*trusted_mirror=*/false, /*consensus_node=*/true));
     BOOST_CHECK(!PreferGetMmAttestPeer(
         /*has_attestation_archive_bit=*/false,
         /*recent_valid_mmattest=*/false));
+}
+
+BOOST_AUTO_TEST_CASE(competing_attested_index_rejects_fossil_depth)
+{
+    using node::matmul_trusted::TrustedMirrorMayAdoptCompetingAttestedIndex;
+    using node::matmul_trusted::TRUSTED_MIRROR_SHORT_REORG_DEPTH;
+    BOOST_CHECK(TrustedMirrorMayAdoptCompetingAttestedIndex(
+        /*attested_suffix_of_active_tip=*/true, /*lca_depth=*/0));
+    BOOST_CHECK(TrustedMirrorMayAdoptCompetingAttestedIndex(false, 1));
+    BOOST_CHECK(TrustedMirrorMayAdoptCompetingAttestedIndex(
+        false, TRUSTED_MIRROR_SHORT_REORG_DEPTH));
+    BOOST_CHECK(!TrustedMirrorMayAdoptCompetingAttestedIndex(
+        false, TRUSTED_MIRROR_SHORT_REORG_DEPTH + 1));
+    BOOST_CHECK(!TrustedMirrorMayAdoptCompetingAttestedIndex(false, 510));
+    BOOST_CHECK(!TrustedMirrorMayAdoptCompetingAttestedIndex(false, 0));
 }
 
 BOOST_AUTO_TEST_CASE(tip_extender_capacity_reserved_under_slot_pressure)

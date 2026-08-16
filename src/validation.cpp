@@ -88,6 +88,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <list>
 #include <numeric>
@@ -9305,6 +9306,24 @@ static constexpr const char* RETRYABLE_MATMUL_ACTIVATION_PREFIX =
             pindex->GetBlockHash(), pindex->nHeight));
 }
 
+[[nodiscard]] static bool MustDeferConflictingAttestedConnect(
+    const ChainstateManager& chainman, const CBlockIndex* pindex)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    if (pindex == nullptr) return false;
+    if (!node::matmul_trusted::IsConfigured()) return false;
+    if (!chainman.GetConsensus().IsMatMulTrustedReplayAttestationActive(
+            pindex->nHeight)) {
+        return false;
+    }
+    const bool has_quorum{node::matmul_trusted::HasQuorum(
+        pindex->GetBlockHash(), pindex->nHeight)};
+    return node::matmul_trusted::MustDeferConflictingAttestedHeight(
+        /*configured=*/true, has_quorum,
+        node::matmul_trusted::HasCompetingQuorum(
+            pindex->GetBlockHash(), pindex->nHeight));
+}
+
 /**
  * Connect a new block to m_chain. pblock is either nullptr or a pointer to a CBlock
  * corresponding to pindexNew, to bypass loading it again from disk.
@@ -9332,6 +9351,14 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
                  pindexNew->GetBlockHash().ToString(), pindexNew->nHeight);
         return state.Error(std::string(RETRYABLE_MATMUL_ACTIVATION_PREFIX) +
                            ": trusted attestation quorum Timeout");
+    }
+    if (MustDeferConflictingAttestedConnect(m_chainman, pindexNew)) {
+        LogDebug(BCLog::VALIDATION,
+                 "ConnectTip: refusing unattested hash=%s height=%d; another "
+                 "hash at this height already has attestation quorum\n",
+                 pindexNew->GetBlockHash().ToString(), pindexNew->nHeight);
+        return state.Error(std::string(RETRYABLE_MATMUL_ACTIVATION_PREFIX) +
+                           ": conflicting attested height");
     }
     // Genesis (height 0) must still connect so LoadChainTip can attach the
     // chain. After that, honor shutdown before ReadBlock / ConnectBlock so
@@ -9503,14 +9530,32 @@ static bool TrustedMirrorShouldConsiderMostWorkCandidate(
     const bool extends_tip{
         candidate->nHeight >= tip->nHeight &&
         candidate->GetAncestor(tip->nHeight) == tip};
+    const bool immediate_tip_child{
+        candidate->pprev == tip &&
+        candidate->nHeight == tip->nHeight + 1};
     const CBlockIndex* lca{LastCommonAncestor(tip, candidate)};
     const int lca_depth{lca != nullptr ? tip->nHeight - lca->nHeight : 0};
+    bool would_abandon_attested{false};
+    if (lca != nullptr && candidate != tip) {
+        for (const CBlockIndex* walk{tip}; walk != nullptr && walk != lca;
+             walk = walk->pprev) {
+            if (node::matmul_trusted::HasQuorumInMemory(
+                    walk->GetBlockHash(), walk->nHeight)) {
+                would_abandon_attested = true;
+                break;
+            }
+        }
+    }
     return node::matmul_trusted::TrustedMirrorMaySelectMostWorkCandidate(
         extends_tip,
         node::matmul_trusted::TrustedMirrorIsShortTipReorg(lca_depth),
         node::matmul_trusted::HasQuorum(
             candidate->GetBlockHash(), candidate->nHeight),
-        node::matmul_trusted::HasQuorum(tip->GetBlockHash(), tip->nHeight));
+        node::matmul_trusted::HasQuorum(tip->GetBlockHash(), tip->nHeight),
+        immediate_tip_child,
+        would_abandon_attested,
+        node::matmul_trusted::HasCompetingQuorum(
+            candidate->GetBlockHash(), candidate->nHeight));
 }
 
 CBlockIndex* Chainstate::FindMostWorkChain()
@@ -9525,10 +9570,31 @@ CBlockIndex* Chainstate::FindMostWorkChain()
         hysteresis_deferred_candidates.clear();
     };
 
+    // Live 2026-08-15 (PR 105 comments 5302572644 / 5302645714): a
+    // trusted-mirror catch-up rescanned a bounded candidate set inside
+    // ProcessNewBlock with cs_main held, so GETMMATTEST never ran. Cap
+    // skip-continues so ActivateBestChain can yield. Do not treat this as
+    // unbounded set growth: the same hashes were retried (comment
+    // 5302645714).
+    constexpr size_t kFindMostWorkSkipBudget{128};
+    size_t skipped_count{0};
+    // Attestation store cannot change while cs_main is held. Scan once;
+    // re-calling per skip was 20% of the wedged profile (5302629744).
+    CBlockIndex* unique_abandon{const_cast<CBlockIndex*>(
+        m_chainman.FindUniqueCompetingAttestedIndex())};
+
     do {
         if (m_chainman.m_interrupt) {
             restore_hysteresis_deferred_candidates();
             return nullptr;
+        }
+        if (skipped_count >= kFindMostWorkSkipBudget) {
+            LogWarning(
+                "FindMostWorkChain: skip budget exhausted (%u); yielding so "
+                "RPC/net can complete\n",
+                static_cast<unsigned>(skipped_count));
+            restore_hysteresis_deferred_candidates();
+            return m_chain.Tip();
         }
         CBlockIndex *pindexNew = nullptr;
 
@@ -9542,8 +9608,7 @@ CBlockIndex* Chainstate::FindMostWorkChain()
             pindexNew = *it;
         }
 
-        if (CBlockIndex* abandon{const_cast<CBlockIndex*>(
-                m_chainman.FindUniqueCompetingAttestedIndex())}) {
+        if (unique_abandon) {
             // Unique competing attested HAVE_DATA: lost same-height race,
             // attested chain pulled ahead, heavier unattested fork,
             // dual-attested siblings with the signed frontier off this
@@ -9558,9 +9623,9 @@ CBlockIndex* Chainstate::FindMostWorkChain()
             // Erase+continue then FindUniqueCompetingAttestedIndex would
             // otherwise livelock FindMostWorkChain with cs_main held
             // (PR 105 comment 5301483741: b-initload 100% CPU, 0 peers).
-            if (skipped_this_call.count(abandon) == 0) {
-                pindexNew = abandon;
-                setBlockIndexCandidates.insert(abandon);
+            if (skipped_this_call.count(unique_abandon) == 0) {
+                pindexNew = unique_abandon;
+                setBlockIndexCandidates.insert(unique_abandon);
             }
         }
 
@@ -9582,6 +9647,7 @@ CBlockIndex* Chainstate::FindMostWorkChain()
                 !m_chainman.UnparkReorgBranchContainingBlock(pindexNew)) {
                 skipped_this_call.insert(pindexNew);
                 setBlockIndexCandidates.erase(pindexNew);
+                ++skipped_count;
                 continue;
             }
             LogWarning("%s: auto-unparked uniquely attested authority branch hash=%s height=%d (park-escape; unattested heavier rewrites stay parked)\n",
@@ -9594,6 +9660,7 @@ CBlockIndex* Chainstate::FindMostWorkChain()
                        pindexNew->nHeight);
             skipped_this_call.insert(pindexNew);
             setBlockIndexCandidates.erase(pindexNew);
+            ++skipped_count;
             continue;
         }
         if (!TrustedMirrorShouldConsiderMostWorkCandidate(m_chain.Tip(), pindexNew) &&
@@ -9603,6 +9670,16 @@ CBlockIndex* Chainstate::FindMostWorkChain()
                      pindexNew->GetBlockHash().ToString(), pindexNew->nHeight);
             skipped_this_call.insert(pindexNew);
             setBlockIndexCandidates.erase(pindexNew);
+            // Equal-work HAVE_DATA tip-twins stay in the set across the call
+            // (headers-only attested sibling still needs the body later).
+            // Heavier unattested competing towers stay evicted.
+            const bool keep_have_data_tip_twin{
+                m_chain.Tip() != nullptr && pindexNew->pprev == m_chain.Tip() &&
+                pindexNew->nHeight == m_chain.Tip()->nHeight + 1};
+            if (keep_have_data_tip_twin) {
+                hysteresis_deferred_candidates.push_back(pindexNew);
+            }
+            ++skipped_count;
             continue;
         }
 
@@ -9639,7 +9716,10 @@ CBlockIndex* Chainstate::FindMostWorkChain()
             const CBlockIndex* attested_sibling{nullptr};
             const bool consensus_followed_tip_child{
                 !node::matmul_trusted::IsTrustedMirror() &&
-                m_chainman.IndexIsFollowedTipChild(tip, pindexNew)};
+                (m_chainman.IndexIsAttestedChainTipChild(tip, pindexNew) ||
+                 m_chainman.IndexIsFollowedTipChild(tip, pindexNew)) &&
+                !node::matmul_trusted::HasCompetingQuorum(
+                    pindexNew->GetBlockHash(), pindexNew->nHeight)};
             if (extends_tip && !has_quorum && !consensus_followed_tip_child) {
                 auto consider_attested_tip_child = [&](const CBlockIndex* alt) {
                     if (alt == nullptr) return false;
@@ -9647,24 +9727,30 @@ CBlockIndex* Chainstate::FindMostWorkChain()
                         /*distinct_from_candidate=*/alt != pindexNew && alt != tip,
                         /*same_parent=*/alt->pprev == tip,
                         /*same_height_as_tip_child=*/alt->nHeight == tip->nHeight + 1,
-                        /*has_quorum=*/node::matmul_trusted::HasQuorum(
+                        /*has_quorum=*/node::matmul_trusted::HasQuorumInMemory(
                             alt->GetBlockHash(), alt->nHeight),
                         /*failed=*/(alt->nStatus & BLOCK_FAILED_MASK) != 0)) {
                         return true;
                     }
                     // Dual-attested same-height siblings (live 2026-08-15):
                     // unattested children of the quorum loser must not win
-                    // most-work over the attested twin of the tip.
-                    if (tip->pprev == nullptr) return false;
-                    return node::matmul_trusted::TrustedMirrorAttestedSiblingIsActionable(
-                        /*distinct_from_candidate=*/alt != pindexNew && alt != tip,
-                        /*same_parent=*/alt->pprev == tip->pprev,
-                        /*same_height_as_tip_child=*/alt->nHeight == tip->nHeight,
-                        /*has_quorum=*/node::matmul_trusted::HasQuorum(
-                            alt->GetBlockHash(), alt->nHeight),
-                        /*failed=*/(alt->nStatus & BLOCK_FAILED_MASK) != 0);
+                    // most-work over the attested twin of the tip. TRUSTED
+                    // mirrors only: a CONSENSUS signer must still ExactReplay
+                    // the child of its own attested tip (live 190376).
+                    if (node::matmul_trusted::IsTrustedMirror()) {
+                        if (tip->pprev == nullptr) return false;
+                        return node::matmul_trusted::TrustedMirrorAttestedSiblingIsActionable(
+                            /*distinct_from_candidate=*/alt != pindexNew && alt != tip,
+                            /*same_parent=*/alt->pprev == tip->pprev,
+                            /*same_height_as_tip_child=*/alt->nHeight == tip->nHeight,
+                            /*has_quorum=*/node::matmul_trusted::HasQuorumInMemory(
+                                alt->GetBlockHash(), alt->nHeight),
+                            /*failed=*/(alt->nStatus & BLOCK_FAILED_MASK) != 0);
+                    }
+                    return false;
                 };
                 for (CBlockIndex* alt : setBlockIndexCandidates) {
+                    if (m_chainman.m_interrupt) break;
                     if (consider_attested_tip_child(alt)) {
                         attested_sibling = alt;
                         break;
@@ -9705,6 +9791,7 @@ CBlockIndex* Chainstate::FindMostWorkChain()
                 skipped_this_call.insert(pindexNew);
                 setBlockIndexCandidates.erase(pindexNew);
                 hysteresis_deferred_candidates.push_back(pindexNew);
+                ++skipped_count;
                 continue;
             }
         }
@@ -9802,6 +9889,7 @@ CBlockIndex* Chainstate::FindMostWorkChain()
                                    hysteresis_work_margin);
                         setBlockIndexCandidates.erase(pindexNew);
                         hysteresis_deferred_candidates.push_back(pindexNew);
+                        ++skipped_count;
                         continue;
                     }
                 }
@@ -9809,6 +9897,13 @@ CBlockIndex* Chainstate::FindMostWorkChain()
             restore_hysteresis_deferred_candidates();
             return pindexNew;
         }
+        // Missing-data / failed-ancestor: do not let
+        // FindUniqueCompetingAttestedIndex re-insert the same unconnectable
+        // HAVE_DATA descendant next iteration (PR 105 comment 5302572644:
+        // b-msghand 100% in FindMostWorkChain, HEADER_ONLY holes on the
+        // path to an attested frontier).
+        skipped_this_call.insert(pindexNew);
+        ++skipped_count;
     } while(true);
 }
 
@@ -10168,26 +10263,72 @@ bool ChainstateManager::NotifyHeaderTip()
     return fNotify;
 }
 
-static void LimitValidationInterfaceQueue(ValidationSignals& signals) LOCKS_EXCLUDED(cs_main) {
+//! Backpressure only: a 17-block reorg enqueues more than this many
+//! BlockDisconnected + BlockConnected events, which used to force an
+//! unbounded SyncWithValidationInterfaceQueue in ActivateBestChain.
+static constexpr size_t VALIDATION_INTERFACE_DRAIN_THRESHOLD{10};
+//! Stuck subscribers must not pin ABC / submitblock / shutdown. Five seconds
+//! is enough for a healthy queue to drain a deep-reorg burst; on timeout
+//! activation continues and notifications stay asynchronous.
+static constexpr auto VALIDATION_INTERFACE_DRAIN_TIMEOUT{std::chrono::seconds{5}};
+
+static const char* ValidationQueueSyncResultName(ValidationQueueSyncResult result)
+{
+    switch (result) {
+    case ValidationQueueSyncResult::Completed: return "completed";
+    case ValidationQueueSyncResult::TimedOut: return "timeout";
+    case ValidationQueueSyncResult::Interrupted: return "shutdown";
+    }
+    return "unknown";
+}
+
+static void LimitValidationInterfaceQueue(
+    ValidationSignals& signals,
+    const std::function<bool()>& interrupted) LOCKS_EXCLUDED(cs_main)
+{
     AssertLockNotHeld(cs_main);
 
-    if (signals.CallbacksPending() > 10) {
-        signals.SyncWithValidationInterfaceQueue();
+    if (signals.CallbacksPending() <= VALIDATION_INTERFACE_DRAIN_THRESHOLD) {
+        return;
+    }
+    const auto result{signals.TrySyncWithValidationInterfaceQueue(
+        VALIDATION_INTERFACE_DRAIN_TIMEOUT, interrupted)};
+    if (result != ValidationQueueSyncResult::Completed) {
+        LogWarning("validation-interface queue did not drain (%s, pending=%d); "
+                   "continuing without waiting for subscribers\n",
+                   ValidationQueueSyncResultName(result),
+                   signals.CallbacksPending());
     }
 }
 
 //! Drain the validation-interface queue without holding m_chainstate_mutex.
 //! Syncing while that mutex is held deadlocks against net/RPC ActivateBestChain
-//! (scheduler callbacks vs the thread blocked in Sync).
+//! (scheduler callbacks vs the thread blocked in Sync). A stuck subscriber
+//! must not make this wait unbounded (live 2026-08-15: 17-block reorg hung
+//! submitblock, then Shutdown joined those HTTP workers before the durable
+//! chainstate flush).
 template <typename MutexType>
-static void DrainValidationInterfaceQueue(ValidationSignals& signals, UniqueLock<MutexType>& chainstate_lock)
+static void DrainValidationInterfaceQueue(
+    ValidationSignals& signals,
+    UniqueLock<MutexType>& chainstate_lock,
+    const std::function<bool()>& interrupted)
     LOCKS_EXCLUDED(cs_main)
 {
     AssertLockNotHeld(cs_main);
-    if (signals.CallbacksPending() <= 10) return;
+    if (signals.CallbacksPending() <= VALIDATION_INTERFACE_DRAIN_THRESHOLD) {
+        return;
+    }
     Assert(chainstate_lock.owns_lock());
     REVERSE_LOCK(chainstate_lock);
-    signals.SyncWithValidationInterfaceQueue();
+    const auto result{signals.TrySyncWithValidationInterfaceQueue(
+        VALIDATION_INTERFACE_DRAIN_TIMEOUT, interrupted)};
+    if (result != ValidationQueueSyncResult::Completed) {
+        LogWarning("ActivateBestChain: validation-interface queue did not drain "
+                   "(%s, pending=%d); continuing activation without waiting for "
+                   "subscribers\n",
+                   ValidationQueueSyncResultName(result),
+                   signals.CallbacksPending());
+    }
 }
 
 bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<const CBlock> pblock)
@@ -10227,7 +10368,10 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
         // ActivateBestChain this may lead to a deadlock! We should
         // probably have a DEBUG_LOCKORDER test for this in the future.
         if (m_chainman.m_options.signals) {
-            DrainValidationInterfaceQueue(*m_chainman.m_options.signals, chainstate_lock);
+            DrainValidationInterfaceQueue(
+                *m_chainman.m_options.signals,
+                chainstate_lock,
+                [&] { return bool(m_chainman.m_interrupt); });
             if (WITH_LOCK(::cs_main, return m_disabled)) {
                 LogPrintf("m_disabled is set - this chainstate should not be in operation. "
                     "Please report this as a bug. %s\n", CLIENT_BUGREPORT);
@@ -10618,7 +10762,9 @@ bool Chainstate::InvalidateBlock(BlockValidationState& state, CBlockIndex* pinde
     }
     if (m_chainman.m_options.signals) {
         REVERSE_LOCK(chainstate_lock);
-        LimitValidationInterfaceQueue(*m_chainman.m_options.signals);
+        LimitValidationInterfaceQueue(
+            *m_chainman.m_options.signals,
+            [&] { return bool(m_chainman.m_interrupt); });
     }
     return true;
 }
@@ -11160,22 +11306,35 @@ const CBlockIndex* ChainstateManager::FindUniqueCompetingAttestedIndex() const
                 idx->GetBlockHash(), idx->nHeight)) {
             return;
         }
+        // HEADER_ONLY holes on the path to an attested HAVE_DATA frontier
+        // are unconnectable. Proposing them made FindMostWorkChain
+        // erase+re-insert forever with cs_main held (PR 105 5302572644).
+        {
+            const CBlockIndex* const path_lca{LastCommonAncestor(tip, idx)};
+            if (path_lca == nullptr) return;
+            for (const CBlockIndex* walk{idx->pprev};
+                 walk != nullptr && walk != path_lca; walk = walk->pprev) {
+                if (!(walk->nStatus & BLOCK_HAVE_DATA) ||
+                    !walk->IsValid(BLOCK_VALID_TRANSACTIONS) ||
+                    !walk->HaveNumChainTxs()) {
+                    return;
+                }
+            }
+        }
         // Pending-attestation extensions of the active chain must not be
         // disconnected: the signer typically attests ~1 behind the tip.
         if (m_active_chainstate->m_chain.Contains(idx)) return;
-        if (tip_has_quorum) {
+        {
             const CBlockIndex* const lca{LastCommonAncestor(tip, idx)};
             if (lca == nullptr) return;
             const int lca_depth{tip->nHeight - lca->nHeight};
-            // Live 2026-08-15: unique attested HAVE_DATA child of an
-            // already-attested tip (LCA depth 0, suffix not yet connected).
-            // Short-reorg is depth 1–6; depth 0 used to be dropped, so ABC
-            // never selected the catch-up child while GBT kept mining a
-            // competing sibling (signer tip 189675, attested 189676).
             const bool attested_suffix{
                 lca == tip && idx->nHeight > tip->nHeight};
-            if (!attested_suffix &&
-                !node::matmul_trusted::TrustedMirrorIsShortTipReorg(lca_depth)) {
+            // Bound competing forks even when the tip has no quorum (signer
+            // typically attests ~1 behind). Unbounded fossil MMATTEST hijacked
+            // FMWC and left the attested HAVE_DATA tip-child unconnected.
+            if (!node::matmul_trusted::TrustedMirrorMayAdoptCompetingAttestedIndex(
+                    attested_suffix, lca_depth)) {
                 return;
             }
         }
@@ -11205,6 +11364,12 @@ const CBlockIndex* ChainstateManager::FindUniqueCompetingAttestedIndex() const
         // short-reorg away from it.
         if (!suffix.empty()) {
             competing = std::move(suffix);
+        } else if (node::matmul_trusted::HasLocalSigner() &&
+                   !node::matmul_trusted::IsTrustedMirror()) {
+            // CONSENSUS signer: do not abandon an already-attested tip for
+            // a dual-attested short-reorg twin (live 190354 reversal).
+            // Trusted mirrors still recover toward the signed frontier.
+            return nullptr;
         }
     }
 
@@ -11406,6 +11571,40 @@ bool ChainstateManager::IndexIsFollowedTipChild(
            followed->nHeight >= index->nHeight &&
            followed->GetAncestor(tip->nHeight) == tip &&
            followed->GetAncestor(index->nHeight) == index;
+}
+
+bool ChainstateManager::BestHeaderExtendsTip(const CBlockIndex* tip) const
+{
+    AssertLockHeld(::cs_main);
+    if (tip == nullptr || m_best_header == nullptr) return false;
+    return m_best_header->nHeight >= tip->nHeight &&
+           m_best_header->GetAncestor(tip->nHeight) == tip;
+}
+
+bool ChainstateManager::IndexIsAttestedChainTipChild(
+    const CBlockIndex* tip, const CBlockIndex* index) const
+{
+    AssertLockHeld(::cs_main);
+    if (tip == nullptr || index == nullptr || index->pprev != tip) return false;
+    if ((index->nStatus & BLOCK_FAILED_MASK) != 0) return false;
+    if (node::matmul_trusted::IsConfigured() &&
+        node::matmul_trusted::HasCompetingQuorum(
+            index->GetBlockHash(), index->nHeight)) {
+        return false;
+    }
+    if (node::matmul_trusted::HasQuorumInMemory(
+            index->GetBlockHash(), index->nHeight)) {
+        return true;
+    }
+    if (IndexIsFollowedTipChild(tip, index)) return true;
+    // Local signer: m_best_header on a competing fork above this tip used
+    // to leave every attested-chain child "unfollowed", so GPU skip +
+    // HEADER_ONLY getdata froze the signer (live 190376 for ~22 min while
+    // a 67-block unattested tower sat on m_best_header).
+    if (!node::matmul_trusted::HasLocalSigner()) return false;
+    return m_best_header != nullptr &&
+           m_best_header->nHeight > tip->nHeight &&
+           m_best_header->GetAncestor(tip->nHeight) != tip;
 }
 
 bool ChainstateManager::ShouldDeferLosingTipExtension(
@@ -11829,6 +12028,7 @@ void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockInd
                 std::multimap<CBlockIndex*, CBlockIndex*>::iterator it = range.first;
                 queue.push_back(it->second);
                 range.first++;
+                m_blockman.m_blocks_unlinked_members.erase(it->second);
                 m_blockman.m_blocks_unlinked.erase(it);
             }
         }

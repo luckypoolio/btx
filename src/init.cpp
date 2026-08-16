@@ -359,6 +359,43 @@ void Shutdown(NodeContext& node)
     // this; calling it again is idempotent. Doing it here covers the path
     // where Shutdown() runs without Interrupt() (failed init / Qt).
     if (node.peerman) node.peerman->StopBackgroundWorkers();
+
+    // Durable chainstate must be recorded BEFORE StopHTTPServer joins RPC
+    // workers. A stuck submitblock / ActivateBestChain drain previously made
+    // that join unbounded, so the final ForceFlushStateToDisk below was never
+    // reached (live 2026-08-15: 17-block reorg, force-kill, in-memory tip not
+    // on disk). Do not SyncWithValidationInterfaceQueue here: that is the
+    // same unbounded wait. ChainStateFlushed callbacks stay asynchronous.
+    auto flush_chainstate_for_shutdown = [&](const char* reason) {
+        if (!node.chainman) return;
+        LOCK(cs_main);
+        for (Chainstate* chainstate : node.chainman->GetAll()) {
+            if (chainstate->CanFlushToDisk()) {
+                chainstate->CoinsDB().DisableNewCompaction();
+                chainstate->ForceFlushStateToDisk();
+            }
+        }
+        if (node.chainman->HasShieldedState()) {
+            const CBlockIndex* const tip{node.chainman->ActiveTip()};
+            if (node.chainman->HasDurableShieldedSnapshotAt(tip)) {
+                LogPrintf("Shutdown: shielded state already sealed at tip height=%d hash=%s (%s)\n",
+                          tip ? tip->nHeight : -1,
+                          tip ? tip->GetBlockHash().ToString() : uint256{}.ToString(),
+                          reason);
+            } else if (!node.chainman->PersistShieldedState(tip)) {
+                LogPrintf("Shutdown: PersistShieldedState failed while sealing shielded tip (%s); "
+                          "next start may rebuild shielded state from chain\n",
+                          reason);
+            } else {
+                LogPrintf("Shutdown: sealed shielded state at tip height=%d hash=%s (%s)\n",
+                          tip ? tip->nHeight : -1,
+                          tip ? tip->GetBlockHash().ToString() : uint256{}.ToString(),
+                          reason);
+            }
+        }
+    };
+    flush_chainstate_for_shutdown("before HTTP worker join");
+
     StopHTTPRPC();
     StopREST();
     StopRPC();
@@ -386,7 +423,7 @@ void Shutdown(NodeContext& node)
     if (node.autoupdate) node.autoupdate->Stop();
     // Join MatMul verify workers while the scheduler is still running.
     // Completions call ProcessBlockSync → ActivateBestChain →
-    // SyncWithValidationInterfaceQueue. Stopping the scheduler first
+    // TrySyncWithValidationInterfaceQueue. Stopping the scheduler first
     // deadlocks b-shutoff against b-mmverify and skips PersistShieldedState.
     if (node.peerman) node.peerman->StopBackgroundWorkers();
     // After everything has been shut down, but before things get flushed, stop the
@@ -420,38 +457,7 @@ void Shutdown(NodeContext& node)
     }
 
     // FlushStateToDisk generates a ChainStateFlushed callback, which we should avoid missing
-    if (node.chainman) {
-        LOCK(cs_main);
-        for (Chainstate* chainstate : node.chainman->GetAll()) {
-            if (chainstate->CanFlushToDisk()) {
-                // FlushStateToDisk already skips CompactFull when m_chainman.m_interrupt
-                // is set. DisableNewCompaction covers Shutdown() without Interrupt()
-                // (failed init / Qt) so a shutdown flush cannot start a new CompactFull.
-                chainstate->CoinsDB().DisableNewCompaction();
-                chainstate->ForceFlushStateToDisk();
-            }
-        }
-        // §11: seal tip-matched shielded state on graceful stop so a leftover
-        // PREPARED/legacy mutation marker cannot force a multi-hour
-        // from-genesis rebuild on the next start. Skip a second full-tree
-        // fsync when ConnectTip already sealed this tip — that rewrite is what
-        // hung archive shutdowns until systemd SIGKILL.
-        if (node.chainman->HasShieldedState()) {
-            const CBlockIndex* const tip{node.chainman->ActiveTip()};
-            if (node.chainman->HasDurableShieldedSnapshotAt(tip)) {
-                LogPrintf("Shutdown: shielded state already sealed at tip height=%d hash=%s; skipping rewrite\n",
-                          tip ? tip->nHeight : -1,
-                          tip ? tip->GetBlockHash().ToString() : uint256{}.ToString());
-            } else if (!node.chainman->PersistShieldedState(tip)) {
-                LogPrintf("Shutdown: PersistShieldedState failed while sealing shielded tip; "
-                          "next start may rebuild shielded state from chain\n");
-            } else {
-                LogPrintf("Shutdown: sealed shielded state at tip height=%d hash=%s\n",
-                          tip ? tip->nHeight : -1,
-                          tip ? tip->GetBlockHash().ToString() : uint256{}.ToString());
-            }
-        }
-    }
+    flush_chainstate_for_shutdown("after scheduler stop");
 
     // After there are no more peers/RPC left to give us new data which may generate
     // CValidationInterface callbacks, flush them...
@@ -605,7 +611,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-matmultrustedwaitms=<n>", "Maximum time a trusted-mirror block may remain parked awaiting an M-of-N attestation quorum before the attempt is left retryable (non-punitive), in milliseconds (default: 60000, maximum: 600000). Does not block the verify worker: many blocks may await quorum concurrently.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-matmulattestationsignerkeyfile=<file>", "Archive-validator file containing exactly one WIF signing key. Relative paths resolve under the network datadir. The corresponding public key is added to the configured signer set. Protect this file as an online validation key.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-matmulattestationsignerkey=<wif>", "UNSAFE/deprecated convenience form for the archive-validator WIF key; command lines may leak through process listings. Prefer -matmulattestationsignerkeyfile.", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::OPTIONS);
-    argsman.AddArg("-matmulattestationserve", "Serve and relay bounded signed ExactReplay attestations (default: 1 when a local signing key is configured, otherwise 0). Responses prefer the durable datadir archive (matmul_attestations.dat, capacity-bounded to the in-memory store limits). When no signature is cached, an archive with a local ExactReplay-success bit may regenerate its own statement; otherwise a rate-limited background ExactReplay may be queued for canonical Profile-1 blocks.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-matmulattestationserve", "Serve GETMMATTEST from the local attestation store (default: 1 when a local signing key is configured or when -matmulvalidation=trusted, otherwise 0). Trusted mirrors cache-and-forward signatures they have already accepted; they never SignAuthoritative. Consensus signers may set this to 0 to isolate signing from public GETMMATTEST fan-in; newly signed attestations are still pushed to connected peers. When no signature is cached, a serving consensus signer with a local ExactReplay-success bit may regenerate its own statement; otherwise a rate-limited background ExactReplay may be queued for canonical Profile-1 blocks.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-matmulservicechallengefile=<file>", "Path to the persistent MatMul service challenge registry. Relative paths are resolved under the network datadir. Point multiple service nodes at the same shared file to let getmatmulservicechallenge issuance and redeemmatmulserviceproof redemption work across the cluster. (default: <netdir>/matmul_service_challenges.dat)", ArgsManager::ALLOW_ANY, OptionsCategory::RPC);
     argsman.AddArg("-matmulasyncverify", "Run the MatMul v4.4 ENC-DR reference recompute for P2P block deliveries on a bounded background worker pool instead of the network message thread (default: 1). Only effective on networks where the v4 fork height is set; verdicts are identical either way (the recompute is a pure function of the header) — this only changes WHICH thread computes them. Set to 0 to force the historical fully-synchronous path.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-matmulrcheaderfirst", "Begin admitted near-tip RC ExactReplay from the immutable block header while compact/full block transactions transfer and validate (default: 1). The early verdict grants no chainwork; complete block validation remains authoritative.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -1527,14 +1533,16 @@ bool AppInitParameterInteraction(const ArgsManager& args)
         args.GetIntArg("-matmultrustedwaitms", 60'000)};
     const bool serve_attestations{
         args.GetBoolArg("-matmulattestationserve",
-                        has_local_attestation_signer)};
+                        has_local_attestation_signer ||
+                            trusted_mirror_mode)};
     if (matmul_validation_mode != "consensus" &&
         has_local_attestation_signer) {
         return InitError(_("Only an independent MatMul consensus validator can load an attestation signing key; remove -matmulattestationsignerkeyfile/-matmulattestationsignerkey from non-consensus nodes."));
     }
-    if (matmul_validation_mode != "consensus" &&
-        serve_attestations) {
-        return InitError(_("Only an independent MatMul consensus validator can serve authoritative attestations. Set -matmulattestationserve=0 on non-consensus nodes."));
+    if (serve_attestations &&
+        matmul_validation_mode != "consensus" &&
+        matmul_validation_mode != "trusted") {
+        return InitError(_("Only a MatMul consensus validator or trusted mirror can serve attestations. Set -matmulattestationserve=0 on economic/SPV nodes."));
     }
     if (attestation_config_requested) {
         if (trusted_signers.empty() &&
@@ -2428,10 +2436,18 @@ static bool InitializeMatMulRCReadinessPostDaemon(
     // FinalizeConfiguration has already derived and installed the signer in
     // the child. Query that runtime state instead of copying sensitive key
     // arguments again during service publication.
-    if (node::matmul_trusted::ServesAttestations() &&
-        node::matmul_trusted::HasLocalSigner() &&
-        matmul_validation_mode == "consensus" && rc_strict_device_ready) {
-        services |= static_cast<uint64_t>(NODE_MATMUL_ATTESTATION_ARCHIVE);
+    // ARCHIVE means "answers GETMMATTEST", not "holds the signing key".
+    // Signers advertise it only when they also serve (GPU-ready consensus).
+    // Trusted mirrors advertise it for cache-and-forward so miners/archives
+    // do not have to fan GETMMATTEST into the signing path.
+    if (node::matmul_trusted::ServesAttestations()) {
+        if (matmul_validation_mode == "trusted") {
+            services |= static_cast<uint64_t>(NODE_MATMUL_ATTESTATION_ARCHIVE);
+        } else if (node::matmul_trusted::HasLocalSigner() &&
+                   matmul_validation_mode == "consensus" &&
+                   rc_strict_device_ready) {
+            services |= static_cast<uint64_t>(NODE_MATMUL_ATTESTATION_ARCHIVE);
+        }
     }
     g_local_services = static_cast<ServiceFlags>(services);
     return true;

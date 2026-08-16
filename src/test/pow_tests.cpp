@@ -2617,11 +2617,41 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_hardening_anchor_consistency)
 
     BOOST_CHECK(!params->AssumeutxoForHeight(189307).has_value());
 
+    const auto assumeutxo_190467 = params->AssumeutxoForHeight(190467);
+    BOOST_REQUIRE(assumeutxo_190467.has_value());
+    BOOST_CHECK_EQUAL(assumeutxo_190467->height, 190467);
+    BOOST_CHECK_EQUAL(
+        assumeutxo_190467->hash_serialized.ToString(),
+        "6ec3e0f1c6377962012e31c030a54e481ff419929d6beae0c2f3aaae82429d3a");
+    BOOST_CHECK_EQUAL(assumeutxo_190467->m_chain_tx_count, 288575U);
+    BOOST_CHECK_EQUAL(
+        assumeutxo_190467->blockhash.GetHex(),
+        "5799b5a4dd00a86947305239341896b595c33684e168216963516acf1cc312da");
+    BOOST_CHECK_EQUAL(
+        assumeutxo_190467->shielded_state_commitment.GetHex(),
+        "94343b766b39c0ea2d92d83323f77b5ccc5e775d99b34b01f5fa6400f2354541");
+
+    const auto assumeutxo_190507 = params->AssumeutxoForHeight(190507);
+    BOOST_REQUIRE(assumeutxo_190507.has_value());
+    BOOST_CHECK_EQUAL(assumeutxo_190507->height, 190507);
+    BOOST_CHECK_EQUAL(
+        assumeutxo_190507->hash_serialized.ToString(),
+        "2563ecff2b06ef20e592a57deb47d52b4ffe7e1fb1fdda1746adf4f33a9dec81");
+    BOOST_CHECK_EQUAL(assumeutxo_190507->m_chain_tx_count, 288615U);
+    BOOST_CHECK_EQUAL(
+        assumeutxo_190507->blockhash.GetHex(),
+        "9142fe23aca98fa3a79c31ed2a0af74d41d0915f9914998e6a40808009496fe5");
+    BOOST_CHECK_EQUAL(
+        assumeutxo_190507->shielded_state_commitment.GetHex(),
+        "94343b766b39c0ea2d92d83323f77b5ccc5e775d99b34b01f5fa6400f2354541");
+
     const auto snapshot_heights = params->GetAvailableSnapshotHeights();
-    BOOST_REQUIRE_EQUAL(snapshot_heights.size(), 21U);
+    BOOST_REQUIRE_EQUAL(snapshot_heights.size(), 23U);
     BOOST_CHECK(std::is_sorted(snapshot_heights.begin(), snapshot_heights.end()));
     BOOST_CHECK_EQUAL(snapshot_heights.front(), 55000);
-    BOOST_CHECK_EQUAL(snapshot_heights.back(), 179000);
+    BOOST_CHECK_EQUAL(snapshot_heights.back(), 190507);
+    // Checkpoints may trail assumeutxo (186000 checkpoint vs 190507 snapshot);
+    // keep both anchors consistent with chainparams rather than forcing parity.
 }
 
 BOOST_AUTO_TEST_CASE(HasValidProofOfWork_matmul_phase1_checks)
