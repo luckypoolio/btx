@@ -5038,6 +5038,30 @@ BOOST_AUTO_TEST_CASE(authenticated_chain_progress_lane_does_not_pace_one_per_min
     BOOST_CHECK(!occupier.fDisconnect);
 }
 
+BOOST_AUTO_TEST_CASE(authenticated_chain_progress_lane_stale_header_policy)
+{
+    // The normal followed-child proof remains sufficient in every mode.
+    BOOST_CHECK(MayUseMatMulAuthenticatedProgressLane(
+        /*followed_tip_child=*/true, /*requested_body=*/false,
+        /*attestation_authority_configured=*/false));
+    BOOST_CHECK(MayUseMatMulAuthenticatedProgressLane(
+        /*followed_tip_child=*/true, /*requested_body=*/false,
+        /*attestation_authority_configured=*/true));
+
+    // Signer-free snapshot recovery may fall back only to a scheduler-requested
+    // direct-tip body. Unsolicited siblings and authority-selected chains must
+    // still prove that they are the followed child.
+    BOOST_CHECK(MayUseMatMulAuthenticatedProgressLane(
+        /*followed_tip_child=*/false, /*requested_body=*/true,
+        /*attestation_authority_configured=*/false));
+    BOOST_CHECK(!MayUseMatMulAuthenticatedProgressLane(
+        /*followed_tip_child=*/false, /*requested_body=*/false,
+        /*attestation_authority_configured=*/false));
+    BOOST_CHECK(!MayUseMatMulAuthenticatedProgressLane(
+        /*followed_tip_child=*/false, /*requested_body=*/true,
+        /*attestation_authority_configured=*/true));
+}
+
 BOOST_AUTO_TEST_CASE(duplicate_header_no_progress_flood_disconnects_inbound_peer)
 {
     LOCK(NetEventsInterface::g_msgproc_mutex);

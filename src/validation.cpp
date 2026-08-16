@@ -9028,6 +9028,16 @@ void Chainstate::UpdateTip(const CBlockIndex* pindexNew)
         return;
     }
 
+    // m_best_header is a download/fork-choice target, but it must never be
+    // published below the chain we have already activated. Trust-adjusted
+    // reconstruction can otherwise leave it on an older authenticated
+    // ancestor after snapshot invalidation, disabling catch-up budgets while
+    // peers have thousands of accepted headers ahead.
+    if (m_chainman.m_best_header == nullptr ||
+        m_chainman.m_best_header->nHeight < pindexNew->nHeight) {
+        m_chainman.SetBestHeader(const_cast<CBlockIndex*>(pindexNew));
+    }
+
     // New best block
     if (m_mempool) {
         m_mempool->AddTransactionsUpdated(1);
@@ -20134,6 +20144,10 @@ void ChainstateManager::RecalculateBestHeader()
     if (!node::matmul_trusted::IsConfigured() || active_tip == nullptr) {
         for (auto& entry : m_blockman.m_block_index) {
             if (entry.second.nStatus & BLOCK_FAILED_MASK) continue;
+            if (active_tip != nullptr &&
+                entry.second.nHeight < active_tip->nHeight) {
+                continue;
+            }
             // Authenticated-work selection with a bounded unauth allowance: a short
             // unverified MatMul suffix may displace a losing tip for chase, but a
             // forged flood beyond the allowance cannot outrank authenticated work.

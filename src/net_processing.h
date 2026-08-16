@@ -103,6 +103,21 @@ constexpr bool ShouldRequestBlocksFromMatMulPeer(
         blocks_in_flight < max_blocks_in_flight;
 }
 
+/** Whether a direct child of the active tip may bypass RC source-rate
+ * counters. A followed child is already uniquely selected by fork choice. If
+ * no attestation authority is configured, a body explicitly requested by the
+ * block-download scheduler is the only safe fallback when trust-adjusted
+ * m_best_header publication temporarily trails the active snapshot tip.
+ * Pending-work limits and full ExactReplay still apply at the call site. */
+constexpr bool MayUseMatMulAuthenticatedProgressLane(
+    bool followed_tip_child,
+    bool requested_body,
+    bool attestation_authority_configured)
+{
+    return followed_tip_child ||
+        (requested_body && !attestation_authority_configured);
+}
+
 struct MatMulPreferredDownloadReconcileResult {
     bool removed{false};
     bool counter_inconsistent{false};

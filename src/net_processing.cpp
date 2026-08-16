@@ -309,9 +309,6 @@ enum class DupHeaderDisposition : uint8_t {
     const CBlock& block,
     bool requested) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
 {
-    // `requested` is informational. Selection is the followed tip-child:
-    // competing siblings are never followed, so they keep the 1/min windows.
-    (void)requested;
     const CBlockIndex* const tip{chainman.ActiveChain().Tip()};
     if (tip == nullptr || block.hashPrevBlock != tip->GetBlockHash()) {
         return false;
@@ -321,7 +318,9 @@ enum class DupHeaderDisposition : uint8_t {
     if (index == nullptr || (index->nStatus & BLOCK_FAILED_MASK) != 0) {
         return false;
     }
-    return chainman.IndexIsFollowedTipChild(tip, index);
+    return MayUseMatMulAuthenticatedProgressLane(
+        chainman.IndexIsFollowedTipChild(tip, index), requested,
+        node::matmul_trusted::IsConfigured());
 }
 
 /** How far the followed (tip-extending) header chain is ahead of the active
@@ -9677,7 +9676,7 @@ void PeerManagerImpl::MaybeStartMatMulRCHeaderVerification(
         {
             LOCK(cs_main);
             progress_lane = IsAuthenticatedChainProgressCandidate(
-                m_chainman, CBlock{header}, /*requested=*/true);
+                m_chainman, CBlock{header}, /*requested=*/false);
         }
         if (!ConsumeMatMulVerificationBudgetForPeer(
                 peer, node.nKeyedNetGroup, params, work, charged_at,
@@ -10763,9 +10762,7 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
         if (matmul_admission.rc_profile) {
             LOCK(cs_main);
             progress_lane = IsAuthenticatedChainProgressCandidate(
-                m_chainman, *block,
-                force_processing || is_retained_retry ||
-                    matmul_admission.retain_as_requested);
+                m_chainman, *block, force_processing);
         }
         if (ConsumeMatMulVerificationBudgetForPeer(
                 *peer, node.nKeyedNetGroup,
