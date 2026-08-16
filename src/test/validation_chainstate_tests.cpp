@@ -760,6 +760,45 @@ BOOST_FIXTURE_TEST_CASE(chainstate_reports_shared_recovery_phase, TestChain100Se
     BOOST_CHECK_EQUAL(state.reorg_depth, 2U);
 }
 
+BOOST_FIXTURE_TEST_CASE(recalculated_best_header_never_precedes_active_tip, TestChain100Setup)
+{
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    LOCK(::cs_main);
+    CBlockIndex* const active_tip{chainman.ActiveChainstate().m_chain.Tip()};
+    BOOST_REQUIRE(active_tip != nullptr);
+    BOOST_REQUIRE_GT(active_tip->nHeight, 20);
+
+    CBlockIndex* const saved_best{chainman.m_best_header};
+    const arith_uint256 saved_authenticated_work{
+        active_tip->nAuthenticatedChainWork};
+    struct RestoreBestHeaderState {
+        ChainstateManager& chainman;
+        CBlockIndex* tip;
+        CBlockIndex* best;
+        arith_uint256 authenticated_work;
+        ~RestoreBestHeaderState()
+        {
+            tip->nAuthenticatedChainWork = authenticated_work;
+            chainman.SetBestHeader(best);
+        }
+    } restore{chainman, active_tip, saved_best, saved_authenticated_work};
+
+    // Reproduce snapshot recovery where the active tip inherits an older
+    // authenticated-work base. A fully authenticated ancestor can outrank it
+    // under the bounded trust metric, but must never become the published
+    // best header because it is below already-activated chainstate.
+    const CBlockIndex* const old_authenticated_base{
+        active_tip->GetAncestor(active_tip->nHeight - 20)};
+    BOOST_REQUIRE(old_authenticated_base != nullptr);
+    active_tip->nAuthenticatedChainWork =
+        old_authenticated_base->nAuthenticatedChainWork;
+    chainman.SetBestHeader(active_tip);
+    chainman.RecalculateBestHeader();
+
+    BOOST_REQUIRE(chainman.m_best_header != nullptr);
+    BOOST_CHECK_GE(chainman.m_best_header->nHeight, active_tip->nHeight);
+}
+
 BOOST_FIXTURE_TEST_CASE(chainstate_shallow_reorg_hysteresis_defers_until_work_margin, TestChain100Setup)
 {
     ChainstateManager& chainman = *Assert(m_node.chainman);
