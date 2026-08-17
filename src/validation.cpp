@@ -14978,6 +14978,16 @@ void Chainstate::PopulateBlockIndexCandidates()
 {
     AssertLockHeld(::cs_main);
     const CBlockIndex* active_snapshot_base{m_chainman.GetSnapshotBaseBlock()};
+    const CBlockIndex* const tip{m_chain.Tip()};
+
+    // Candidate reconstruction runs across the complete block index. Apply
+    // the same work floor as TryAddBlockIndexCandidate before invoking its
+    // configured fork-choice checks: those checks may walk from the tip to a
+    // competing candidate and made startup quadratic on fork-heavy indexes.
+    // Attestation state cannot change while cs_main is held, so resolve the
+    // sole below-tip exception once for the whole reconstruction pass.
+    const CBlockIndex* const attested_abandon{
+        m_chainman.FindUniqueCompetingAttestedIndex()};
 
     for (CBlockIndex* pindex : m_blockman.GetAllBlockIndices()) {
         // An assumeutxo chainstate needs its own snapshot base as an immediate
@@ -14991,11 +15001,17 @@ void Chainstate::PopulateBlockIndexCandidates()
             !pindex->pprev->HaveNumChainTxs()};
         if (background_snapshot_base_parent_unprocessed) continue;
 
-        if (pindex == SnapshotBase() ||
+        const bool valid_candidate{
+            pindex == SnapshotBase() ||
             (pindex->IsValid(BLOCK_VALID_TRANSACTIONS) &&
-             (pindex->HaveNumChainTxs() || pindex->pprev == nullptr))) {
-            TryAddBlockIndexCandidate(pindex);
+             (pindex->HaveNumChainTxs() || pindex->pprev == nullptr))};
+        if (!valid_candidate) continue;
+        if (tip != nullptr &&
+            setBlockIndexCandidates.value_comp()(pindex, tip) &&
+            pindex != attested_abandon) {
+            continue;
         }
+        TryAddBlockIndexCandidate(pindex);
     }
 }
 
