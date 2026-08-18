@@ -253,6 +253,11 @@ static void EnsureMiningTemplateHasActiveTip(
     if (chainman.ActiveChain().Tip() == nullptr) {
         throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD, CLIENT_NAME " has no active tip yet");
     }
+    if (chainman.IsInitialBlockDownload()) {
+        throw JSONRPCError(
+            RPC_CLIENT_IN_INITIAL_DOWNLOAD,
+            CLIENT_NAME " is in initial block download; getblocktemplate will not issue stale mining work");
+    }
 }
 
 /**
@@ -295,23 +300,52 @@ static void EnsureMatMulAttestedMiningParent(
     // unique HAVE_DATA child 189676 attested, GBT kept mining).
     const CBlockIndex* const attested{
         chainman.FindUniqueCompetingAttestedIndex()};
-    if (attested == nullptr || attested == tip) return;
-
-    if (!(attested->nStatus & BLOCK_HAVE_DATA) ||
-        !attested->IsValid(BLOCK_VALID_TRANSACTIONS) ||
-        !attested->HaveNumChainTxs()) {
-        return;
+    if (attested != nullptr && attested != tip &&
+        (attested->nStatus & BLOCK_HAVE_DATA) &&
+        attested->IsValid(BLOCK_VALID_TRANSACTIONS) &&
+        attested->HaveNumChainTxs()) {
+        throw JSONRPCError(
+            RPC_CLIENT_IN_INITIAL_DOWNLOAD,
+            strprintf(
+                "Active tip %s (height %d) is not the unique competing attested block %s (height %d) available with HAVE_DATA. "
+                "getblocktemplate will not extend the unattested race. Wait for the node to adopt the attested tip, or follow getmatmulattestedtip.",
+                tip->GetBlockHash().GetHex(),
+                tip->nHeight,
+                attested->GetBlockHash().GetHex(),
+                attested->nHeight));
     }
 
-    throw JSONRPCError(
-        RPC_CLIENT_IN_INITIAL_DOWNLOAD,
-        strprintf(
-            "Active tip %s (height %d) is not the unique competing attested block %s (height %d) available with HAVE_DATA. "
-            "getblocktemplate will not extend the unattested race. Wait for the node to adopt the attested tip, or follow getmatmulattestedtip.",
-            tip->GetBlockHash().GetHex(),
-            tip->nHeight,
-            attested->GetBlockHash().GetHex(),
-            attested->nHeight));
+    if (active_at_tip &&
+        !node::matmul_trusted::HasQuorumInMemory(
+            tip->GetBlockHash(), tip->nHeight)) {
+        throw JSONRPCError(
+            RPC_CLIENT_IN_INITIAL_DOWNLOAD,
+            strprintf(
+                "Active tip %s (height %d) has no configured-signer attestation quorum. "
+                "getblocktemplate will not issue work until the mining parent is authenticated.",
+                tip->GetBlockHash().GetHex(), tip->nHeight));
+    }
+
+    if (active_at_tip) {
+        for (const auto& hint : node::matmul_trusted::AttestedFrontierHints()) {
+            if (hint.height < tip->nHeight ||
+                !node::matmul_trusted::HasQuorumInMemory(
+                    hint.hash, hint.height)) {
+                continue;
+            }
+            if (hint.height == tip->nHeight &&
+                hint.hash == tip->GetBlockHash()) {
+                continue;
+            }
+            throw JSONRPCError(
+                RPC_CLIENT_IN_INITIAL_DOWNLOAD,
+                strprintf(
+                    "Configured-signer frontier %s (height %d) is ahead of or conflicts with active tip %s (height %d). "
+                    "getblocktemplate will not mine while authenticated chain data is pending.",
+                    hint.hash.GetHex(), hint.height,
+                    tip->GetBlockHash().GetHex(), tip->nHeight));
+        }
+    }
 }
 
 /**
@@ -8817,7 +8851,7 @@ static RPCHelpMan getblocktemplate()
         "It returns data needed to construct a block to work on.\n"
         "For MatMul PoW networks, the template includes matrix seeds and parameters needed for external mining.\n"
         "External miners should solve the MatMul proof using the provided seeds and submit via submitblock.\n"
-        "When -matmultrustedpubkey is configured and Profile-1 attestation is active, a template is not issued when a unique competing attested HAVE_DATA sibling exists (unattested lost twin or dual-attested short-reorg) or when a unique attested HAVE_DATA child of the current tip is waiting to be connected (catch-up); follow getmatmulattestedtip instead.\n"
+        "A template is not issued during initial block download. When -matmultrustedpubkey is configured and Profile-1 attestation is active, the active mining parent must have configured-signer quorum and no authenticated frontier may be ahead of or conflict with it; follow getmatmulattestedtip while authenticated chain data is pending.\n"
         "For full specification, see BIPs 22, 23, 9, and 145:\n"
         "    https://github.com/bitcoin/bips/blob/master/bip-0022.mediawiki\n"
         "    https://github.com/bitcoin/bips/blob/master/bip-0023.mediawiki\n"

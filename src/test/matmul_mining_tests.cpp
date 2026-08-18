@@ -2509,6 +2509,76 @@ public:
 
 BOOST_FIXTURE_TEST_SUITE(matmul_gbt_attestation_bind_tests, MatMulGbtAttestationBindSetup)
 
+BOOST_AUTO_TEST_CASE(getblocktemplate_requires_quorum_on_active_profile1_tip)
+{
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    auto& consensus = const_cast<Consensus::Params&>(chainman.GetConsensus());
+    const int32_t saved_v4{consensus.nMatMulV4Height};
+    const int32_t saved_rc{consensus.nMatMulRCHeight};
+    struct Restore {
+        Consensus::Params& consensus;
+        int32_t v4;
+        int32_t rc;
+        ~Restore()
+        {
+            node::matmul_trusted::ResetForTest();
+            consensus.nMatMulV4Height = v4;
+            consensus.nMatMulRCHeight = rc;
+        }
+    } restore{consensus, saved_v4, saved_rc};
+
+    const CBlockIndex* const tip{
+        WITH_LOCK(::cs_main, return chainman.ActiveChain().Tip())};
+    BOOST_REQUIRE(tip != nullptr);
+    const uint256 tip_hash{tip->GetBlockHash()};
+    const int32_t tip_height{tip->nHeight};
+
+    consensus.nMatMulV4Height = tip_height;
+    consensus.nMatMulRCHeight = tip_height;
+    BOOST_REQUIRE(consensus.IsMatMulTrustedReplayAttestationActive(tip_height));
+
+    CKey signer;
+    signer.MakeNewKey(/*fCompressed=*/true);
+    const uint256 chain_id{uint256::ONE};
+    const uint256 authority_context{
+        uint256::FromHex(std::string(64, 'c')).value()};
+    matmul::trusted::StoreConfig config;
+    config.chain_id = chain_id;
+    config.replay_authority_context = authority_context;
+    config.trusted_signers = {signer.GetPubKey()};
+    config.threshold = 1;
+    std::string error;
+    BOOST_REQUIRE(node::matmul_trusted::Configure(
+        std::move(config), /*trusted_mirror=*/false, /*serve=*/false,
+        std::chrono::milliseconds{50}, error));
+    BOOST_CHECK(!node::matmul_trusted::HasLocalSigner());
+
+    const auto missing_quorum = CallRPCError("getblocktemplate", GBTParams());
+    BOOST_REQUIRE(missing_quorum.has_value());
+    BOOST_CHECK_EQUAL(
+        missing_quorum->find_value("code").getInt<int>(),
+        RPC_CLIENT_IN_INITIAL_DOWNLOAD);
+    BOOST_CHECK(
+        missing_quorum->find_value("message").get_str().find(
+            "has no configured-signer attestation quorum") !=
+        std::string::npos);
+
+    matmul::trusted::ExactReplayStatement statement;
+    statement.chain_id = chain_id;
+    statement.block_hash = tip_hash;
+    statement.block_height = tip_height;
+    statement.replay_authority_context = authority_context;
+    const auto attestation{matmul::trusted::SignStatement(statement, signer)};
+    BOOST_REQUIRE(attestation.has_value());
+    BOOST_REQUIRE(node::matmul_trusted::Add(
+                      *attestation, tip_hash, tip_height) ==
+                  matmul::trusted::AddResult::Accepted);
+
+    const auto tmpl = CallRPC("getblocktemplate", GBTParams()).get_obj();
+    BOOST_CHECK_EQUAL(
+        tmpl.find_value("previousblockhash").get_str(), tip_hash.GetHex());
+}
+
 BOOST_AUTO_TEST_CASE(getblocktemplate_refuses_unattested_tip_with_attested_sibling)
 {
     ChainstateManager& chainman = *Assert(m_node.chainman);
