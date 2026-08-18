@@ -2509,7 +2509,7 @@ public:
 
 BOOST_FIXTURE_TEST_SUITE(matmul_gbt_attestation_bind_tests, MatMulGbtAttestationBindSetup)
 
-BOOST_AUTO_TEST_CASE(getblocktemplate_requires_quorum_on_active_profile1_tip)
+BOOST_AUTO_TEST_CASE(getblocktemplate_allows_linear_configured_signer_lag)
 {
     ChainstateManager& chainman = *Assert(m_node.chainman);
     auto& consensus = const_cast<Consensus::Params&>(chainman.GetConsensus());
@@ -2530,6 +2530,8 @@ BOOST_AUTO_TEST_CASE(getblocktemplate_requires_quorum_on_active_profile1_tip)
     const CBlockIndex* const tip{
         WITH_LOCK(::cs_main, return chainman.ActiveChain().Tip())};
     BOOST_REQUIRE(tip != nullptr);
+    const CBlockIndex* const parent{tip->pprev};
+    BOOST_REQUIRE(parent != nullptr);
     const uint256 tip_hash{tip->GetBlockHash()};
     const int32_t tip_height{tip->nHeight};
 
@@ -2553,26 +2555,22 @@ BOOST_AUTO_TEST_CASE(getblocktemplate_requires_quorum_on_active_profile1_tip)
         std::chrono::milliseconds{50}, error));
     BOOST_CHECK(!node::matmul_trusted::HasLocalSigner());
 
-    const auto missing_quorum = CallRPCError("getblocktemplate", GBTParams());
-    BOOST_REQUIRE(missing_quorum.has_value());
-    BOOST_CHECK_EQUAL(
-        missing_quorum->find_value("code").getInt<int>(),
-        RPC_CLIENT_IN_INITIAL_DOWNLOAD);
-    BOOST_CHECK(
-        missing_quorum->find_value("message").get_str().find(
-            "has no configured-signer attestation quorum") !=
-        std::string::npos);
-
     matmul::trusted::ExactReplayStatement statement;
     statement.chain_id = chain_id;
-    statement.block_hash = tip_hash;
-    statement.block_height = tip_height;
+    statement.block_hash = parent->GetBlockHash();
+    statement.block_height = parent->nHeight;
     statement.replay_authority_context = authority_context;
     const auto attestation{matmul::trusted::SignStatement(statement, signer)};
     BOOST_REQUIRE(attestation.has_value());
     BOOST_REQUIRE(node::matmul_trusted::Add(
-                      *attestation, tip_hash, tip_height) ==
+                      *attestation, parent->GetBlockHash(), parent->nHeight) ==
                   matmul::trusted::AddResult::Accepted);
+    BOOST_REQUIRE(node::matmul_trusted::HasQuorumInMemory(
+        parent->GetBlockHash(), parent->nHeight));
+    BOOST_CHECK(!node::matmul_trusted::HasQuorumInMemory(
+        tip_hash, tip_height));
+    BOOST_CHECK(WITH_LOCK(::cs_main, return chainman.FindUniqueCompetingAttestedIndex()) ==
+                nullptr);
 
     const auto tmpl = CallRPC("getblocktemplate", GBTParams()).get_obj();
     BOOST_CHECK_EQUAL(

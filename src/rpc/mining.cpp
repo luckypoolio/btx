@@ -315,17 +315,6 @@ static void EnsureMatMulAttestedMiningParent(
                 attested->nHeight));
     }
 
-    if (active_at_tip &&
-        !node::matmul_trusted::HasQuorumInMemory(
-            tip->GetBlockHash(), tip->nHeight)) {
-        throw JSONRPCError(
-            RPC_CLIENT_IN_INITIAL_DOWNLOAD,
-            strprintf(
-                "Active tip %s (height %d) has no configured-signer attestation quorum. "
-                "getblocktemplate will not issue work until the mining parent is authenticated.",
-                tip->GetBlockHash().GetHex(), tip->nHeight));
-    }
-
     if (active_at_tip) {
         for (const auto& hint : node::matmul_trusted::AttestedFrontierHints()) {
             if (hint.height < tip->nHeight ||
@@ -8851,7 +8840,7 @@ static RPCHelpMan getblocktemplate()
         "It returns data needed to construct a block to work on.\n"
         "For MatMul PoW networks, the template includes matrix seeds and parameters needed for external mining.\n"
         "External miners should solve the MatMul proof using the provided seeds and submit via submitblock.\n"
-        "A template is not issued during initial block download. When -matmultrustedpubkey is configured and Profile-1 attestation is active, the active mining parent must have configured-signer quorum and no authenticated frontier may be ahead of or conflict with it; follow getmatmulattestedtip while authenticated chain data is pending.\n"
+        "A template is not issued during initial block download. When -matmultrustedpubkey is configured and Profile-1 attestation is active, a template is not issued when a unique competing attested HAVE_DATA block exists or an authenticated frontier is ahead of or conflicts with the active tip. Linear signer lag on the active chain remains mineable; follow getmatmulattestedtip while authenticated chain data is pending.\n"
         "For full specification, see BIPs 22, 23, 9, and 145:\n"
         "    https://github.com/bitcoin/bips/blob/master/bip-0022.mediawiki\n"
         "    https://github.com/bitcoin/bips/blob/master/bip-0023.mediawiki\n"
