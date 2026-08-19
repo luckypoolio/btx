@@ -44,9 +44,9 @@
     "deficit_reason": "selfqual_failed",
     "native_declined": false
   },
-  "source_revision": "4892a7b69f1931e85398cee24585c8af59a56205",
-  "git_tip": "4892a7b69f1931e85398cee24585c8af59a56205",
-  "embedded_source_revision": "4892a7b69f1931e85398cee24585c8af59a56205",
+  "source_revision": "7e3b054d6399ea5ba843fd9aecb82c7896efe92e",
+  "git_tip": "7e3b054d6399ea5ba843fd9aecb82c7896efe92e",
+  "embedded_source_revision": "7e3b054d6399ea5ba843fd9aecb82c7896efe92e",
   "embedded_source_dirty": false,
   "peak_rss_kib": 6968496,
   "run_variance": {
@@ -486,6 +486,6 @@
   "gpu_campaign_present": true,
   "nvlink_campaign_present": false,
   "consensus_note": "mainnet nMatMulRCHeight=185000 (ENC_RC activation height is set); this harness reports evidence but does not authorize or change consensus parameters. This harness never recommends changing consensus height. Projections/MAC estimates are NOT EVIDENCE for rc-gate GO. Cross-host Metal and datacenter campaigns remain Stage G blockers.",
-  "source_tree_fingerprint": "844545f6996c87f219027ca8127fa3fd5fed6375923d954c0e2280ca7fd0732c",
+  "source_tree_fingerprint": "18ab18382043fd1c6520f0ec7bb782df0a6b7fc3bef2b0b314f1057bb9ab035f",
   "harness_sha256": "bcca972e46e39fdf0b49aa55fa61860d190ebe04f07542f0873876ec74297b1d"
 }

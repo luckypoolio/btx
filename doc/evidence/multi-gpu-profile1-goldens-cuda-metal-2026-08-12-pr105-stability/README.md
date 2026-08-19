@@ -24,12 +24,12 @@ Goldens were not re-run on the live GPU. The JSON `source_revision` /
 `tip_sha` / fingerprint fields are rebound to the current production
 freeze so `verify-production-golden-seal.py seal` matches the manifest.
 
-Current production freeze (v0.33.3 RPC submit attestation `4892a7b6`):
+Current production freeze (v0.33.3 RPC candidate fast relay `7e3b054d`):
 
 | | |
 |---|---|
-| Manifest / evidence `source_revision` | `4892a7b69f1931e85398cee24585c8af59a56205` |
-| Manifest / evidence fingerprint | `844545f6996c87f219027ca8127fa3fd5fed6375923d954c0e2280ca7fd0732c` |
+| Manifest / evidence `source_revision` | `7e3b054d6399ea5ba843fd9aecb82c7896efe92e` |
+| Manifest / evidence fingerprint | `18ab18382043fd1c6520f0ec7bb782df0a6b7fc3bef2b0b314f1057bb9ab035f` |
 
 Both harnesses executed 1,129,198,441,725,952 consensus MACs on-device
 across the eight episodes at the original capture.
@@ -56,8 +56,8 @@ cohort to the Phase 1 freeze. Digest slot `[4]` is unchanged.
 
 | | |
 |---|---|
-| Manifest `source_revision` | `4892a7b69f1931e85398cee24585c8af59a56205` |
-| Manifest `source_tree_fingerprint` | `844545f6996c87f219027ca8127fa3fd5fed6375923d954c0e2280ca7fd0732c` |
+| Manifest `source_revision` | `7e3b054d6399ea5ba843fd9aecb82c7896efe92e` |
+| Manifest `source_tree_fingerprint` | `18ab18382043fd1c6520f0ec7bb782df0a6b7fc3bef2b0b314f1057bb9ab035f` |
 | Binary cut | `93c27b8332cac61e0e07c694711540f603c98950` (`v0.33.3`) |
 | Nonce-1 digest | `b4777985d4f2621d0b9c119f4188ac7d80158fc92560ade96cc7a3fd8cfae953` |
 | CUDA artifact | [`raw/profile1-cuda-8.json`](raw/profile1-cuda-8.json) |
