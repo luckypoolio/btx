@@ -1214,6 +1214,7 @@ public:
     void LimitOrphanTxSize(uint32_t nMaxOrphans) override EXCLUSIVE_LOCKS_REQUIRED(!m_tx_download_mutex);
     void SendPings() override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void RelayTransaction(const uint256& txid, const uint256& wtxid) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
+    void RequestMatMulTrustedAttestationsForBlock(const uint256& hash) override;
     void SetDandelionManager(Dandelion::DandelionManager* mgr) override;
     void SetBestBlock(int height, std::chrono::seconds time) override
     {
@@ -9434,6 +9435,23 @@ void PeerManagerImpl::RequestMatMulTrustedAttestations(
             it->second.asked_preferred = true;
         }
     }
+}
+
+void PeerManagerImpl::RequestMatMulTrustedAttestationsForBlock(
+    const uint256& hash)
+{
+    {
+        LOCK(cs_main);
+        const CBlockIndex* index{
+            m_chainman.m_blockman.LookupBlockIndex(hash)};
+        if (index == nullptr ||
+            !m_chainparams.GetConsensus()
+                 .IsMatMulTrustedReplayAttestationActive(index->nHeight)) {
+            return;
+        }
+    }
+
+    RequestMatMulTrustedAttestations(hash, /*source=*/-1);
 }
 
 void PeerManagerImpl::BeginMatMulAuthenticatedRelayObservation(

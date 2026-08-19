@@ -17,12 +17,14 @@
 #include <node/warnings.h>
 #include <pow.h>
 #include <protocol.h>
+#include <rpc/server.h>
 #include <script/script.h>
 #include <streams.h>
 #include <test/util/logging.h>
 #include <test/util/mining.h>
 #include <test/util/net.h>
 #include <test/util/setup_common.h>
+#include <util/strencodings.h>
 #include <validation.h>
 
 #include <algorithm>
@@ -1697,6 +1699,133 @@ BOOST_AUTO_TEST_CASE(getmmattest_skips_non_serving_peers)
     BOOST_CHECK(!HasQueuedMessageType(miner, NetMsgType::GETMMATTEST));
     BOOST_CHECK(HasQueuedMessageType(mirror, NetMsgType::GETMMATTEST));
     BOOST_CHECK(HasQueuedMessageType(consensus_peer, NetMsgType::GETMMATTEST));
+}
+
+// A local submitblock does not pass through P2P admission. Even a duplicate
+// retry must start the same bounded attestation request exactly once.
+BOOST_AUTO_TEST_CASE(rpc_submitblock_requests_getmmattest_once)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    ResetSharedPeermanFixture(m_node);
+
+    node::matmul_trusted::ResetForTest();
+    CKey signer;
+    signer.MakeNewKey(/*fCompressed=*/true);
+    matmul::trusted::StoreConfig config;
+    config.chain_id = uint256::FromHex(std::string(64, '1')).value();
+    config.replay_authority_context =
+        uint256::FromHex(std::string(64, '2')).value();
+    config.trusted_signers = {signer.GetPubKey()};
+    config.threshold = 1;
+    std::string error;
+    BOOST_REQUIRE(node::matmul_trusted::Configure(
+        std::move(config), /*trusted_mirror=*/true, /*serve=*/false,
+        std::chrono::milliseconds{50}, error));
+    struct MirrorReset {
+        ~MirrorReset() { node::matmul_trusted::ResetForTest(); }
+    } mirror_reset;
+
+    ChainstateManager& chainman{*Assert(m_node.chainman)};
+    PeerManager& peerman{*Assert(m_node.peerman)};
+    ConnmanTestMsg& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    const CBlockIndex* tip{
+        WITH_LOCK(::cs_main, return chainman.ActiveChain().Tip())};
+    BOOST_REQUIRE(tip != nullptr);
+    SetMockTime(std::chrono::seconds{tip->GetBlockTime() + 1});
+
+    Consensus::Params& consensus = const_cast<Consensus::Params&>(
+        chainman.GetParams().GetConsensus());
+    const int32_t saved_rc = consensus.nMatMulRCHeight;
+    const int32_t saved_v4 = consensus.nMatMulV4Height;
+    const int32_t saved_bmx4c = consensus.nMatMulBMX4CHeight;
+    const int32_t saved_drlt = consensus.nMatMulDRLTHeight;
+    const int32_t saved_coupled = consensus.nMatMulRCCoupledHeight;
+    struct RestoreConsensus {
+        Consensus::Params& params;
+        int32_t rc;
+        int32_t v4;
+        int32_t bmx4c;
+        int32_t drlt;
+        int32_t coupled;
+        ~RestoreConsensus()
+        {
+            params.nMatMulRCHeight = rc;
+            params.nMatMulV4Height = v4;
+            params.nMatMulBMX4CHeight = bmx4c;
+            params.nMatMulDRLTHeight = drlt;
+            params.nMatMulRCCoupledHeight = coupled;
+        }
+    } restore_consensus{consensus, saved_rc, saved_v4, saved_bmx4c,
+                        saved_drlt, saved_coupled};
+
+    const int32_t activation{tip->nHeight};
+    consensus.nMatMulV4Height = activation;
+    consensus.nMatMulBMX4CHeight = activation;
+    consensus.nMatMulDRLTHeight = std::numeric_limits<int32_t>::max();
+    consensus.nMatMulRCHeight = activation;
+    consensus.nMatMulRCCoupledHeight = std::numeric_limits<int32_t>::max();
+    peerman.SetBestBlock(tip->nHeight,
+                         std::chrono::seconds{tip->GetBlockTime()});
+    BOOST_REQUIRE(
+        consensus.IsMatMulTrustedReplayAttestationActive(activation));
+
+    const ServiceFlags archive_services{ServiceFlags(
+        NODE_NETWORK | NODE_WITNESS | NODE_MATMUL_CONSENSUS |
+        NODE_MATMUL_ATTESTATION_ARCHIVE)};
+    CNode archive{/*id=*/601,
+                  /*sock=*/nullptr,
+                  CAddress{},
+                  /*nKeyedNetGroupIn=*/0,
+                  /*nLocalHostNonceIn=*/0,
+                  CAddress{},
+                  /*addrNameIn=*/"rpc-submit-archive",
+                  ConnectionType::OUTBOUND_FULL_RELAY,
+                  /*inbound_onion=*/false,
+                  /*network_key=*/0};
+    connman.Handshake(archive, /*successfully_connected=*/true,
+                      archive_services, archive_services, PROTOCOL_VERSION,
+                      /*relay_txs=*/true);
+    connman.AddTestNode(archive);
+    connman.FlushSendBuffer(archive);
+    struct FinalizePeer {
+        PeerManager& peerman;
+        ConnmanTestMsg& connman;
+        CNode& peer;
+        ~FinalizePeer()
+        {
+            peerman.FinalizeNode(peer);
+            connman.RemoveTestNode(peer);
+        }
+    } finalize{peerman, connman, archive};
+
+    CBlock block;
+    BOOST_REQUIRE(WITH_LOCK(
+        ::cs_main, return chainman.m_blockman.ReadBlock(block, *tip)));
+    DataStream block_stream{};
+    block_stream << TX_WITH_WITNESS(block);
+    const std::string block_hex{HexStr(block_stream)};
+
+    auto submit = [&] {
+        JSONRPCRequest request;
+        request.context = &m_node;
+        request.strMethod = "submitblock";
+        request.params = UniValue{UniValue::VARR};
+        request.params.push_back(block_hex);
+        if (RPCIsInWarmup(nullptr)) SetRPCWarmupFinished();
+        return tableRPC.execute(request);
+    };
+
+    const UniValue first_result{submit()};
+    BOOST_REQUIRE(first_result.isStr());
+    BOOST_CHECK_EQUAL(first_result.get_str(), "duplicate");
+    BOOST_CHECK_EQUAL(
+        CountQueuedMessageType(archive, NetMsgType::GETMMATTEST), 1U);
+
+    const UniValue duplicate_result{submit()};
+    BOOST_REQUIRE(duplicate_result.isStr());
+    BOOST_CHECK_EQUAL(duplicate_result.get_str(), "duplicate");
+    BOOST_CHECK_EQUAL(
+        CountQueuedMessageType(archive, NetMsgType::GETMMATTEST), 1U);
 }
 
 // Qualifier on 5bc1e3d4: a trusted mirror whose tip is still the last

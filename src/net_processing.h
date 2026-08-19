@@ -268,6 +268,11 @@ public:
     /** Relay transaction to all peers. */
     virtual void RelayTransaction(const uint256& txid, const uint256& wtxid) = 0;
 
+    /** Request trusted MatMul attestations for a locally submitted block.
+     *  The implementation applies the same eligibility, deduplication, and
+     *  backoff rules as peer-originated block processing. */
+    virtual void RequestMatMulTrustedAttestationsForBlock(const uint256& hash) = 0;
+
     /** Set the Dandelion++ manager (owned by NodeContext). */
     virtual void SetDandelionManager(Dandelion::DandelionManager* mgr) = 0;
 
