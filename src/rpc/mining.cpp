@@ -9691,7 +9691,7 @@ static RPCHelpMan submitblock()
     const std::string& block_hex = request.params[0].get_str();
     EnforceBlockHexSizeLimit(block_hex, "hexdata");
 
-    EnsureAnyNodeContext(request.context);
+    NodeContext& node = EnsureAnyNodeContext(request.context);
 
     std::shared_ptr<CBlock> blockptr = std::make_shared<CBlock>();
     CBlock& block = *blockptr;
@@ -9713,6 +9713,9 @@ static RPCHelpMan submitblock()
     CHECK_NONFATAL(chainman.m_options.signals)->RegisterSharedValidationInterface(sc);
     bool accepted = chainman.ProcessNewBlock(blockptr, /*force_processing=*/true, /*min_pow_checked=*/true, /*new_block=*/&new_block);
     CHECK_NONFATAL(chainman.m_options.signals)->UnregisterSharedValidationInterface(sc);
+    if (accepted && node.peerman) {
+        node.peerman->RequestMatMulTrustedAttestationsForBlock(block.GetHash());
+    }
     if (!new_block && accepted) {
         return "duplicate";
     }
