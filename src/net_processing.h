@@ -273,6 +273,10 @@ public:
      *  backoff rules as peer-originated block processing. */
     virtual void RequestMatMulTrustedAttestationsForBlock(const uint256& hash) = 0;
 
+    /** Provisionally relay a cheap-checked RPC mining candidate while local
+     *  ExactReplay is still running. This grants no validity or chainwork. */
+    virtual void RelayMatMulRpcCandidate(const CBlock& block) = 0;
+
     /** Set the Dandelion++ manager (owned by NodeContext). */
     virtual void SetDandelionManager(Dandelion::DandelionManager* mgr) = 0;
 

@@ -1215,6 +1215,7 @@ public:
     void SendPings() override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void RelayTransaction(const uint256& txid, const uint256& wtxid) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void RequestMatMulTrustedAttestationsForBlock(const uint256& hash) override;
+    void RelayMatMulRpcCandidate(const CBlock& block) override;
     void SetDandelionManager(Dandelion::DandelionManager* mgr) override;
     void SetBestBlock(int height, std::chrono::seconds time) override
     {
@@ -2411,10 +2412,15 @@ private:
     std::vector<NodeId> SelectProvisionalMatMulRCRelayPeers(
         NodeId source_id, const uint256& prev_hash)
         LOCKS_EXCLUDED(cs_main);
+    std::vector<NodeId> SelectMatMulRpcCandidateRelayPeers(
+        const uint256& prev_hash)
+        LOCKS_EXCLUDED(cs_main);
     void RememberMatMulRCOutboundTicket(
         const node::RCAdmissionTicket& ticket);
     std::optional<node::RCAdmissionTicket> LookupMatMulRCOutboundTicket(
         const uint256& hash) const;
+    std::optional<node::RCAdmissionTicket> EnsureMatMulRCOutboundTicket(
+        const CBlockHeader& header, int32_t height);
 
     /** The historical synchronous body of ProcessBlock, made node-lifetime-safe
      *  so it can also run on a worker thread after the peer vanished. `node` is
@@ -6443,25 +6449,9 @@ void PeerManagerImpl::NewPoWValidBlock(const CBlockIndex *pindex, const std::sha
         consensus_params.IsMatMulProductPayloadRequired(pindex->nHeight);
     auto pcmpctblock = std::make_shared<const CBlockHeaderAndShortTxIDs>(*pblock, FastRandomContext().rand64());
     const uint256 hashBlock{pblock->GetHash()};
-    std::optional<node::RCAdmissionTicket> rc_admission_ticket{
-        LookupMatMulRCOutboundTicket(hashBlock)};
-    if (!rc_admission_ticket && m_opts.matmul_rc_admission &&
-        consensus_params.IsMatMulRCFamilyActive(pindex->nHeight)) {
-        node::RCAdmissionTicket ticket{hashBlock, 0};
-        uint64_t tries{MATMUL_RC_ADMISSION_MAX_GRIND_TRIES};
-        if (node::GrindRCAdmissionTicket(
-                pblock->GetBlockHeader(), consensus_params.powLimit,
-                ticket, tries)) {
-            rc_admission_ticket = ticket;
-            RememberMatMulRCOutboundTicket(ticket);
-        } else {
-            LogWarning(
-                "matmul: unable to grind rcadmit for locally relayed block %s within %llu attempts\n",
-                hashBlock.ToString(),
-                static_cast<unsigned long long>(
-                    MATMUL_RC_ADMISSION_MAX_GRIND_TRIES));
-        }
-    }
+    const std::optional<node::RCAdmissionTicket> rc_admission_ticket{
+        EnsureMatMulRCOutboundTicket(pblock->GetBlockHeader(),
+                                     pindex->nHeight)};
 
     LOCK(cs_main);
 
@@ -8117,6 +8107,37 @@ PeerManagerImpl::LookupMatMulRCOutboundTicket(const uint256& hash) const
     return it->second;
 }
 
+std::optional<node::RCAdmissionTicket>
+PeerManagerImpl::EnsureMatMulRCOutboundTicket(
+    const CBlockHeader& header, int32_t height)
+{
+    const uint256 hash{header.GetHash()};
+    if (const auto existing{LookupMatMulRCOutboundTicket(hash)}) {
+        return existing;
+    }
+
+    const Consensus::Params& params{m_chainparams.GetConsensus()};
+    if (!m_opts.matmul_rc_admission ||
+        !params.IsMatMulRCFamilyActive(height)) {
+        return std::nullopt;
+    }
+
+    node::RCAdmissionTicket ticket{hash, 0};
+    uint64_t tries{MATMUL_RC_ADMISSION_MAX_GRIND_TRIES};
+    if (!node::GrindRCAdmissionTicket(
+            header, params.powLimit, ticket, tries)) {
+        LogWarning(
+            "matmul: unable to grind rcadmit for locally relayed block %s within %llu attempts\n",
+            hash.ToString(),
+            static_cast<unsigned long long>(
+                MATMUL_RC_ADMISSION_MAX_GRIND_TRIES));
+        return std::nullopt;
+    }
+
+    RememberMatMulRCOutboundTicket(ticket);
+    return ticket;
+}
+
 bool PeerManagerImpl::ConsumeMatMulAttestationInboundBudget(
     uint64_t keyed_netgroup,
     uint64_t count,
@@ -9452,6 +9473,157 @@ void PeerManagerImpl::RequestMatMulTrustedAttestationsForBlock(
     }
 
     RequestMatMulTrustedAttestations(hash, /*source=*/-1);
+}
+
+void PeerManagerImpl::RelayMatMulRpcCandidate(const CBlock& block)
+{
+    AssertLockNotHeld(cs_main);
+    AssertLockNotHeld(m_connman.GetNodesMutex());
+
+    if (!m_opts.matmul_rc_provisional_relay) return;
+
+    BlockValidationState state;
+    if (!CheckBlock(block, state, m_chainparams.GetConsensus())) {
+        LogWarning(
+            "matmul: refusing provisional RPC candidate relay hash=%s reason=%s\n",
+            block.GetHash().ToString(), state.ToString());
+        return;
+    }
+
+    const uint256 hash{block.GetHash()};
+    int32_t height{-1};
+    {
+        LOCK(cs_main);
+        const CBlockIndex* existing{
+            m_chainman.m_blockman.LookupBlockIndex(hash)};
+        if (existing != nullptr &&
+            (existing->nStatus & BLOCK_HAVE_DATA)) {
+            return;
+        }
+
+        const CBlockIndex* parent{
+            m_chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock)};
+        const CBlockIndex* active_tip{m_chainman.ActiveTip()};
+        if (parent == nullptr || parent != active_tip ||
+            parent->nHeight == std::numeric_limits<int32_t>::max() ||
+            parent->nAuthenticatedChainWork != parent->nChainWork ||
+            m_chainman.IsInitialBlockDownload()) {
+            return;
+        }
+        height = parent->nHeight + 1;
+        if (!m_chainparams.GetConsensus().IsMatMulRCFamilyActive(height)) {
+            return;
+        }
+    }
+
+    const auto ticket{
+        EnsureMatMulRCOutboundTicket(block.GetBlockHeader(), height)};
+    if (!ticket) return;
+
+    // Attestation archives commonly negotiate BIP152 low-bandwidth mode. A
+    // full body lets them start ExactReplay now instead of waiting for this
+    // node's local replay and a later GETDATA round trip.
+    const std::vector<NodeId> targets{
+        SelectMatMulRpcCandidateRelayPeers(block.hashPrevBlock)};
+    uint32_t relayed{0};
+    for (const NodeId peer_id : targets) {
+        const bool sent{m_connman.ForNode(peer_id, [&](CNode* peer_node) {
+            std::vector<CBlock> relay_headers{
+                CBlock{block.GetBlockHeader()}};
+            MakeAndPushMessage(
+                *peer_node, NetMsgType::HEADERS,
+                TX_WITH_WITNESS(relay_headers));
+            MakeAndPushMessage(
+                *peer_node, NetMsgType::RCADMIT, *ticket);
+            MakeAndPushMessage(
+                *peer_node, NetMsgType::BLOCK,
+                TX_WITH_WITNESS(block));
+            return true;
+        })};
+        if (sent) ++relayed;
+    }
+
+    if (relayed != 0) {
+        LogInfo(
+            "RPC mining candidate full body provisionally relayed before ExactReplay hash=%s height=%d peers=%u\n",
+            hash.ToString(), height, relayed);
+    } else {
+        LogWarning(
+            "RPC mining candidate has no near-tip MatMul relay peer hash=%s height=%d selected=%u\n",
+            hash.ToString(), height,
+            static_cast<unsigned>(targets.size()));
+    }
+}
+
+std::vector<NodeId> PeerManagerImpl::SelectMatMulRpcCandidateRelayPeers(
+    const uint256& prev_hash)
+{
+    AssertLockNotHeld(cs_main);
+    AssertLockNotHeld(m_connman.GetNodesMutex());
+
+    std::vector<NodeId> connected;
+    m_connman.ForEachNode([&](CNode* peer_node) {
+        if (peer_node->fDisconnect || peer_node->IsInboundConn() ||
+            peer_node->GetCommonVersion() < INVALID_CB_NO_BAN_VERSION) {
+            return;
+        }
+        connected.push_back(peer_node->GetId());
+    });
+
+    struct RankedPeer {
+        NodeId id;
+        int rank;
+    };
+    std::vector<RankedPeer> ranked;
+    for (const NodeId peer_id : connected) {
+        const PeerRef peer{GetPeerRef(peer_id)};
+        if (!peer) continue;
+        const ServiceFlags services{peer->m_their_services.load()};
+        const bool consensus{
+            (services & NODE_MATMUL_CONSENSUS) == NODE_MATMUL_CONSENSUS};
+        const bool archive{
+            (services & NODE_MATMUL_ATTESTATION_ARCHIVE) ==
+            NODE_MATMUL_ATTESTATION_ARCHIVE};
+        const bool mirror{
+            (services & NODE_MATMUL_TRUSTED_MIRROR) ==
+            NODE_MATMUL_TRUSTED_MIRROR};
+        if (!consensus && !archive && !mirror) continue;
+
+        bool has_parent{false};
+        {
+            LOCK(cs_main);
+            const CBlockIndex* previous{
+                m_chainman.m_blockman.LookupBlockIndex(prev_hash)};
+            if (CNodeState* state{State(peer_id)}) {
+                has_parent = previous != nullptr &&
+                    PeerHasHeader(state, previous);
+            }
+        }
+        if (!has_parent) continue;
+        int rank{3};
+        if (consensus && archive) {
+            rank = 0;
+        } else if (archive) {
+            rank = 1;
+        } else if (consensus) {
+            rank = 2;
+        }
+        ranked.push_back({peer_id, rank});
+    }
+
+    std::sort(ranked.begin(), ranked.end(),
+              [](const RankedPeer& lhs, const RankedPeer& rhs) {
+                  if (lhs.rank != rhs.rank) return lhs.rank < rhs.rank;
+                  return lhs.id < rhs.id;
+              });
+    std::vector<NodeId> selected;
+    selected.reserve(std::min<size_t>(
+        ranked.size(), MATMUL_RC_PROVISIONAL_RELAY_PEERS));
+    for (const RankedPeer& peer : ranked) {
+        if (selected.size() >= MATMUL_RC_PROVISIONAL_RELAY_PEERS) break;
+        selected.push_back(peer.id);
+    }
+    return selected;
 }
 
 void PeerManagerImpl::BeginMatMulAuthenticatedRelayObservation(

@@ -9708,6 +9708,10 @@ static RPCHelpMan submitblock()
         }
     }
 
+    if (node.peerman) {
+        node.peerman->RelayMatMulRpcCandidate(block);
+    }
+
     bool new_block;
     auto sc = std::make_shared<submitblock_StateCatcher>(block.GetHash());
     CHECK_NONFATAL(chainman.m_options.signals)->RegisterSharedValidationInterface(sc);

@@ -1701,9 +1701,10 @@ BOOST_AUTO_TEST_CASE(getmmattest_skips_non_serving_peers)
     BOOST_CHECK(HasQueuedMessageType(consensus_peer, NetMsgType::GETMMATTEST));
 }
 
-// A local submitblock does not pass through P2P admission. Even a duplicate
-// retry must start the same bounded attestation request exactly once.
-BOOST_AUTO_TEST_CASE(rpc_submitblock_requests_getmmattest_once)
+// A local submitblock does not pass through P2P admission. Its candidate must
+// fast-relay a full body to a serving peer before ExactReplay, even without
+// BIP152 high-bandwidth negotiation, then request attestation exactly once.
+BOOST_AUTO_TEST_CASE(rpc_candidate_fast_relays_and_submitblock_requests_once)
 {
     LOCK(NetEventsInterface::g_msgproc_mutex);
     ResetSharedPeermanFixture(m_node);
@@ -1784,7 +1785,8 @@ BOOST_AUTO_TEST_CASE(rpc_submitblock_requests_getmmattest_once)
                   /*network_key=*/0};
     connman.Handshake(archive, /*successfully_connected=*/true,
                       archive_services, archive_services, PROTOCOL_VERSION,
-                      /*relay_txs=*/true);
+                      /*relay_txs=*/true,
+                      /*starting_height=*/tip->nHeight + 1);
     connman.AddTestNode(archive);
     connman.FlushSendBuffer(archive);
     struct FinalizePeer {
@@ -1798,11 +1800,11 @@ BOOST_AUTO_TEST_CASE(rpc_submitblock_requests_getmmattest_once)
         }
     } finalize{peerman, connman, archive};
 
-    CBlock block;
+    CBlock parent;
     BOOST_REQUIRE(WITH_LOCK(
-        ::cs_main, return chainman.m_blockman.ReadBlock(block, *tip)));
+        ::cs_main, return chainman.m_blockman.ReadBlock(parent, *tip)));
     DataStream block_stream{};
-    block_stream << TX_WITH_WITNESS(block);
+    block_stream << TX_WITH_WITNESS(parent);
     const std::string block_hex{HexStr(block_stream)};
 
     auto submit = [&] {
@@ -1812,12 +1814,25 @@ BOOST_AUTO_TEST_CASE(rpc_submitblock_requests_getmmattest_once)
         request.params = UniValue{UniValue::VARR};
         request.params.push_back(block_hex);
         if (RPCIsInWarmup(nullptr)) SetRPCWarmupFinished();
-        return tableRPC.execute(request);
+        try {
+            return tableRPC.execute(request);
+        } catch (const UniValue& obj_error) {
+            throw std::runtime_error{
+                obj_error.find_value("message").get_str()};
+        }
     };
 
     const UniValue first_result{submit()};
     BOOST_REQUIRE(first_result.isStr());
     BOOST_CHECK_EQUAL(first_result.get_str(), "duplicate");
+    BOOST_CHECK_EQUAL(
+        CountQueuedMessageType(archive, NetMsgType::HEADERS), 0U);
+    BOOST_CHECK_EQUAL(
+        CountQueuedMessageType(archive, NetMsgType::RCADMIT), 0U);
+    BOOST_CHECK_EQUAL(
+        CountQueuedMessageType(archive, NetMsgType::CMPCTBLOCK), 0U);
+    BOOST_CHECK_EQUAL(
+        CountQueuedMessageType(archive, NetMsgType::BLOCK), 0U);
     BOOST_CHECK_EQUAL(
         CountQueuedMessageType(archive, NetMsgType::GETMMATTEST), 1U);
 
@@ -1825,7 +1840,76 @@ BOOST_AUTO_TEST_CASE(rpc_submitblock_requests_getmmattest_once)
     BOOST_REQUIRE(duplicate_result.isStr());
     BOOST_CHECK_EQUAL(duplicate_result.get_str(), "duplicate");
     BOOST_CHECK_EQUAL(
+        CountQueuedMessageType(archive, NetMsgType::HEADERS), 0U);
+    BOOST_CHECK_EQUAL(
+        CountQueuedMessageType(archive, NetMsgType::RCADMIT), 0U);
+    BOOST_CHECK_EQUAL(
+        CountQueuedMessageType(archive, NetMsgType::CMPCTBLOCK), 0U);
+    BOOST_CHECK_EQUAL(
+        CountQueuedMessageType(archive, NetMsgType::BLOCK), 0U);
+    BOOST_CHECK_EQUAL(
         CountQueuedMessageType(archive, NetMsgType::GETMMATTEST), 1U);
+
+    connman.FlushSendBuffer(archive);
+
+    CBlock peer_next;
+    peer_next.SetNull();
+    peer_next.hashPrevBlock = tip->GetBlockHash();
+    peer_next.hashMerkleRoot = uint256::FromHex(
+        std::string(63, '0') + "1").value();
+    peer_next.nTime = tip->GetBlockTime() + 1;
+    peer_next.nBits = tip->nBits;
+    peer_next.nVersion = VERSIONBITS_TOP_BITS;
+    BOOST_REQUIRE(MineHeaderForConsensus(
+        peer_next, tip->nHeight + 1, consensus, 5'000'000,
+        tip->GetMedianTimePast()));
+    BlockValidationState header_state;
+    BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlockHeaders(
+        {{peer_next.GetBlockHeader()}}, /*min_pow_checked=*/true,
+        header_state), header_state.ToString());
+    std::vector<CBlock> peer_headers{
+        CBlock{parent.GetBlockHeader()},
+        CBlock{peer_next.GetBlockHeader()}};
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(
+        archive,
+        NetMsg::Make(NetMsgType::HEADERS,
+                     TX_WITH_WITNESS(peer_headers))));
+    archive.fPauseSend = false;
+    (void)connman.ProcessMessagesOnce(archive);
+    CNodeStateStats archive_stats;
+    BOOST_REQUIRE(peerman.GetNodeStateStats(archive.GetId(), archive_stats));
+    BOOST_REQUIRE_EQUAL(
+        archive_stats.m_best_known_block_hash,
+        peer_next.GetHash().ToString());
+    BOOST_REQUIRE_EQUAL(archive_stats.m_misbehavior_score, 0);
+    // Keep the socketless synthetic peer available after direct-fetch setup.
+    archive.fDisconnect = false;
+    connman.FlushSendBuffer(archive);
+
+    CBlock block = node::BlockAssembler{
+        chainman.ActiveChainstate(), nullptr, {}, m_node}
+                           .CreateNewBlock()
+                           ->block;
+    block.nTime = tip->GetBlockTime() + 73;
+    block.hashMerkleRoot = BlockMerkleRoot(block);
+    BOOST_REQUIRE(MineHeaderForConsensus(
+        block, tip->nHeight + 1, consensus, 5'000'000,
+        tip->GetMedianTimePast()));
+    BOOST_REQUIRE(block.GetHash() != peer_next.GetHash());
+    BlockValidationState block_state;
+    BOOST_REQUIRE_MESSAGE(
+        CheckBlock(block, block_state, consensus), block_state.ToString());
+    BOOST_REQUIRE(WITH_LOCK(
+        ::cs_main,
+        return chainman.m_blockman.LookupBlockIndex(block.GetHash()) ==
+            nullptr));
+
+    peerman.RelayMatMulRpcCandidate(block);
+    BOOST_CHECK(HasQueuedMessageType(archive, NetMsgType::HEADERS));
+    BOOST_CHECK(HasQueuedMessageType(archive, NetMsgType::RCADMIT));
+    BOOST_CHECK(HasQueuedMessageType(archive, NetMsgType::BLOCK));
+    NeutralizeUnconnectedHeaders(chainman);
+    peerman.ResetMatMulVerifyAdmissionForTest();
 }
 
 // Qualifier on 5bc1e3d4: a trusted mirror whose tip is still the last
