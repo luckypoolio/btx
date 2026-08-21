@@ -9763,9 +9763,15 @@ void PeerManagerImpl::RelayMatMulRpcCandidate(const CBlock& block)
         const CBlockIndex* parent{
             m_chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock)};
         const CBlockIndex* active_tip{m_chainman.ActiveTip()};
+        const bool parent_authenticated{
+            parent != nullptr &&
+            (!m_chainparams.GetConsensus()
+                  .IsMatMulTrustedReplayAttestationActive(parent->nHeight) ||
+             node::matmul_trusted::HasQuorum(
+                 parent->GetBlockHash(), parent->nHeight))};
         if (parent == nullptr || parent != active_tip ||
             parent->nHeight == std::numeric_limits<int32_t>::max() ||
-            parent->nAuthenticatedChainWork != parent->nChainWork ||
+            !parent_authenticated ||
             m_chainman.IsInitialBlockDownload()) {
             return;
         }

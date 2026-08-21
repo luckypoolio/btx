@@ -1718,6 +1718,7 @@ BOOST_AUTO_TEST_CASE(rpc_candidate_fast_relays_and_submitblock_requests_once)
         uint256::FromHex(std::string(64, '2')).value();
     config.trusted_signers = {signer.GetPubKey()};
     config.threshold = 1;
+    config.local_signer = signer;
     std::string error;
     BOOST_REQUIRE(node::matmul_trusted::Configure(
         std::move(config), /*trusted_mirror=*/true, /*serve=*/false,
@@ -1904,7 +1905,33 @@ BOOST_AUTO_TEST_CASE(rpc_candidate_fast_relays_and_submitblock_requests_once)
         return chainman.m_blockman.LookupBlockIndex(block.GetHash()) ==
             nullptr));
 
+    // A snapshot/restart may leave historical authenticated chainwork behind
+    // even though the active parent itself has signer quorum. Relay must use
+    // the parent verdict, not require every historical block to be attested.
+    BOOST_REQUIRE(node::matmul_trusted::SignAuthoritative(
+                      tip->GetBlockHash(), tip->nHeight) ==
+                  matmul::trusted::AddResult::Accepted);
+    BOOST_REQUIRE(node::matmul_trusted::HasQuorum(
+        tip->GetBlockHash(), tip->nHeight));
+    arith_uint256 saved_authenticated_work;
+    {
+        LOCK(::cs_main);
+        CBlockIndex* mutable_tip{
+            chainman.m_blockman.LookupBlockIndex(tip->GetBlockHash())};
+        BOOST_REQUIRE(mutable_tip != nullptr);
+        saved_authenticated_work = mutable_tip->nAuthenticatedChainWork;
+        mutable_tip->nAuthenticatedChainWork = {};
+        BOOST_REQUIRE(mutable_tip->nAuthenticatedChainWork <
+                      mutable_tip->nChainWork);
+    }
     peerman.RelayMatMulRpcCandidate(block);
+    {
+        LOCK(::cs_main);
+        CBlockIndex* mutable_tip{
+            chainman.m_blockman.LookupBlockIndex(tip->GetBlockHash())};
+        BOOST_REQUIRE(mutable_tip != nullptr);
+        mutable_tip->nAuthenticatedChainWork = saved_authenticated_work;
+    }
     BOOST_CHECK(HasQueuedMessageType(archive, NetMsgType::HEADERS));
     BOOST_CHECK(HasQueuedMessageType(archive, NetMsgType::RCADMIT));
     BOOST_CHECK(HasQueuedMessageType(archive, NetMsgType::BLOCK));
