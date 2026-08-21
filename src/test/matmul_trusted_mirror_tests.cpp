@@ -1782,6 +1782,19 @@ BOOST_AUTO_TEST_CASE(competing_attested_index_rejects_fossil_depth)
     BOOST_CHECK(!ConsensusMaySpendExactReplayGpuForShortReorgForkChild(
         true, false, true, false, /*lca_depth=*/7, true, false, false,
         false));
+    using node::matmul_trusted::ConsensusMayFetchLowerWorkSignedFrontier;
+    // Live 196278-196280: the pool extended an unattested losing twin before
+    // restart, leaving the signed short fork one block lower in raw work.
+    BOOST_CHECK(ConsensusMayFetchLowerWorkSignedFrontier(
+        /*configured_attested_race=*/true,
+        /*active_tip_has_quorum=*/false,
+        /*peer_best_on_signed_frontier_chain=*/true));
+    BOOST_CHECK(!ConsensusMayFetchLowerWorkSignedFrontier(
+        false, false, true));
+    BOOST_CHECK(!ConsensusMayFetchLowerWorkSignedFrontier(
+        true, /*active_tip_has_quorum=*/true, true));
+    BOOST_CHECK(!ConsensusMayFetchLowerWorkSignedFrontier(
+        true, false, /*peer_best_on_signed_frontier_chain=*/false));
     using node::matmul_trusted::ShouldRetryBudgetDeferredWhileFrontierOffChain;
     BOOST_CHECK(ShouldRetryBudgetDeferredWhileFrontierOffChain(
         /*frontier_off_active_chain=*/false, /*fork_child=*/false,

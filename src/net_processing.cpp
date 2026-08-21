@@ -4520,6 +4520,7 @@ void PeerManagerImpl::FindNextBlocksToDownload(const Peer& peer, unsigned int co
     // -matmultrustedpubkey must use the same exceptions: skipping every
     // non-extending peer here is the live race-loss stall (headers of the
     // attested sibling, body never requested, tip frozen on the loser).
+    bool configured_attested_race{false};
     if (!node::matmul_trusted::IsTrustedMirror() && tip != nullptr &&
         state->pindexBestKnownBlock != nullptr) {
         const bool extends_tip{
@@ -4531,7 +4532,7 @@ void PeerManagerImpl::FindNextBlocksToDownload(const Peer& peer, unsigned int co
                 state->pindexBestKnownBlock->GetAncestor(
                     recovery.followed_target->nHeight) ==
                     recovery.followed_target};
-            const bool configured_attested_race{
+            configured_attested_race =
                 node::matmul_trusted::IsConfigured() &&
                 TrustedMirrorMayDownloadIndex(
                     m_chainman,
@@ -4539,7 +4540,7 @@ void PeerManagerImpl::FindNextBlocksToDownload(const Peer& peer, unsigned int co
                         peer.m_id, peer.m_their_services,
                         state->pindexBestKnownBlock),
                     tip,
-                    state->pindexBestKnownBlock)};
+                    state->pindexBestKnownBlock);
             if (!recovery_target && !configured_attested_race &&
                 !yield_to_this_peer) {
                 log_skip("competing_not_active_tip_chain");
@@ -4548,15 +4549,29 @@ void PeerManagerImpl::FindNextBlocksToDownload(const Peer& peer, unsigned int co
         }
     }
 
-    // Download eligibility uses CLAIMED nChainWork only (mirror and consensus).
-    // Trust-adjusted work is for preference/acceptance, not fetch: bodies are
-    // self-validating, and this path is SELF-HEALING (earliest-first from the
+    // Download eligibility normally uses CLAIMED nChainWork only (mirror and
+    // consensus). A short signed branch can be lower-work than an unattested
+    // local tower after the pool extended the losing twin before signer
+    // quorum arrived. Refusing its first missing body leaves the node pinned
+    // to the unauthenticated branch even though the signed frontier is known.
+    const bool lower_work_signed_frontier_recovery{
+        state->pindexBestKnownBlock != nullptr && tip != nullptr &&
+        node::matmul_trusted::ConsensusMayFetchLowerWorkSignedFrontier(
+            configured_attested_race,
+            m_chainman.IndexHasTrustedMatMulAuthority(tip),
+            m_chainman.IndexIsOnSignedFrontierChain(
+                state->pindexBestKnownBlock))};
+    // Outside that bounded recovery, trust-adjusted work is for preference /
+    // acceptance, not fetch. Bodies are self-validating, and this path is
+    // SELF-HEALING (earliest-first from the
     // fork; an invalid body fails the branch and punishes the peer). The
     // MinimumChainWork floor stays on claimed work for bootstrap liveness.
     // Pre-fork nAuthenticatedChainWork == nChainWork, so this matches the
     // historical raw-nChainWork test.
     if (state->pindexBestKnownBlock == nullptr ||
-        state->pindexBestKnownBlock->nChainWork < m_chainman.ActiveChain().Tip()->nChainWork ||
+        (state->pindexBestKnownBlock->nChainWork <
+             m_chainman.ActiveChain().Tip()->nChainWork &&
+         !lower_work_signed_frontier_recovery) ||
         state->pindexBestKnownBlock->nChainWork < m_chainman.MinimumChainWork()) {
         // This peer has nothing interesting.
         log_skip(state->pindexBestKnownBlock == nullptr ? "no_best_known"

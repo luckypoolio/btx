@@ -398,6 +398,19 @@ static constexpr int GETMMATTEST_HAMMER_BAN_AFTER{32};
     return TrustedMirrorIsShortTipReorg(lca_depth);
 }
 
+/** A short signed-frontier recovery can legitimately have less raw work than
+ *  an unattested local tower. Permit fetching that branch only after the
+ *  competing-branch gate accepted it, while the active tip has no quorum and
+ *  the peer's best header is on the signed-frontier chain. */
+[[nodiscard]] inline bool ConsensusMayFetchLowerWorkSignedFrontier(
+    bool configured_attested_race,
+    bool active_tip_has_quorum,
+    bool peer_best_on_signed_frontier_chain)
+{
+    return configured_attested_race && !active_tip_has_quorum &&
+           peer_best_on_signed_frontier_chain;
+}
+
 /** While the signed frontier is off the active chain, budget-deferred
  *  retry may only re-admit the attested fork-child / frontier path.
  *  Historical losing twins (live 195579/195599/195601) occupied admission
