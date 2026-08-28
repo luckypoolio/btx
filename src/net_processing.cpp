@@ -1094,10 +1094,11 @@ struct CNodeState {
     /** Whether this peer advertised NODE_MATMUL_ATTESTATION_ARCHIVE (trusted
      *  mirrors may follow its better-work competing branch after a race). */
     bool m_matmul_attestation_archive{false};
-    /** NODE_MATMUL_TRUSTED_MIRROR / NODE_NETWORK from VERSION. Used to pick
-     *  signed-frontier catch-up getdata sources without GetPeerRef. */
+    /** NODE_MATMUL_TRUSTED_MIRROR / block-serving services from VERSION. Used
+     *  to pick signed-frontier catch-up getdata sources without GetPeerRef. */
     bool m_matmul_trusted_mirror{false};
     bool m_node_network{false};
+    bool m_can_serve_blocks{false};
     /** VERSION nStartingHeight. -1 until handshake. Used to decide whether
      *  a preferred archive actually had the catch-up suffix at connect. */
     int m_starting_height{-1};
@@ -2134,6 +2135,11 @@ private:
         std::chrono::microseconds stale_after) const
         EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
+    /** True when any current owner advertised NODE_NETWORK or
+     *  NODE_NETWORK_LIMITED during VERSION. */
+    bool BlockInFlightHasAdvertisedBlockSource(const uint256& hash) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
     /** Have we requested this block from an outbound peer */
     bool IsBlockRequestedFromOutbound(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_peer_mutex);
 
@@ -2851,6 +2857,16 @@ bool PeerManagerImpl::BlockInFlightFullyStale(const uint256& hash,
         }
     }
     return true;
+}
+
+bool PeerManagerImpl::BlockInFlightHasAdvertisedBlockSource(const uint256& hash) const
+{
+    const auto range{mapBlocksInFlight.equal_range(hash)};
+    for (auto it{range.first}; it != range.second; ++it) {
+        const CNodeState* const owner{State(it->second.first)};
+        if (owner != nullptr && owner->m_can_serve_blocks) return true;
+    }
+    return false;
 }
 
 bool PeerManagerImpl::IsBlockRequestedFromOutbound(const uint256& hash)
@@ -4774,24 +4790,34 @@ void PeerManagerImpl::FindNextBlocksToDownload(const Peer& peer, unsigned int co
         root_first_clamped, tip, state->pindexBestKnownBlock,
         &m_chainman.ActiveChain())};
     state->pindexLastCommonBlock = root_first.last_common;
-        if (root_first.lowest_missing != nullptr &&
+    if (root_first.lowest_missing != nullptr &&
         !IsHeaderOnlyFetchSuppressed(m_chainman, tip, root_first.lowest_missing,
                                      m_header_only_competing,
                                      m_header_only_followed_skip,
                                      state->pindexBestKnownBlock) &&
-        !m_matmul_block_lifecycle.HasRetainedBody(root_first.lowest_missing->GetBlockHash()) &&
-        node::matmul_trusted::CanonicalFirstHoleMayReassign(
-            IsBlockRequested(root_first.lowest_missing->GetBlockHash()),
-            BlockInFlightFullyStale(root_first.lowest_missing->GetBlockHash(),
-                                    now_for_diag, rerequest_stale_after))) {
-        // Drop only fully-stale/missing-stamp owners. Do not require
-        // root_first.clamped: a hole that was already clamped on a prior
-        // pass must still reassign (1.4 / §7). MayDuplicate(owners<2)
-        // used to fire here and cancel a fresh GPU GETDATA; the body
-        // then arrived unsolicited and was ticket-dropped (live public CPU archive
-        // 2026-08-16).
+        !m_matmul_block_lifecycle.HasRetainedBody(
+            root_first.lowest_missing->GetBlockHash())) {
         const uint256 hole{root_first.lowest_missing->GetBlockHash()};
-        if (IsBlockRequested(hole)) {
+        const bool requested{IsBlockRequested(hole)};
+        const bool prefer_advertised_source{
+            CanServeBlocks(peer) && requested &&
+            !BlockInFlightHasAdvertisedBlockSource(hole)};
+        const bool stale_reassign{
+            node::matmul_trusted::CanonicalFirstHoleMayReassign(
+                requested,
+                BlockInFlightFullyStale(hole, now_for_diag,
+                                        rerequest_stale_after))};
+        if (prefer_advertised_source || stale_reassign) {
+            // A configured legacy GPU peer may omit NODE_NETWORK yet still
+            // serve blocks. Keep that fallback, but do not let a fresh request
+            // to a discovery-only peer pin the canonical root when a peer that
+            // explicitly advertises block service is ready.
+            if (prefer_advertised_source) {
+                LogInfo("Reassigning catch-up root %s to advertised block-serving peer=%d\n",
+                        hole.ToString(), peer.m_id);
+            }
+            // Do not require root_first.clamped: a hole that was already
+            // clamped on a prior pass must still reassign (1.4 / §7).
             RemoveBlockRequest(hole, std::nullopt);
         }
     }
@@ -13681,6 +13707,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
                 NODE_MATMUL_TRUSTED_MIRROR;
             state->m_node_network =
                 (nServices & NODE_NETWORK) == NODE_NETWORK;
+            state->m_can_serve_blocks = CanServeBlocks(*peer);
             state->m_starting_height = starting_height;
             MaybeSeedGpuSignedFrontierBestKnown(pfrom.GetId(), *state);
             MaybeSeedLocalSignerLostTwinBestKnown(pfrom.GetId(), *state);

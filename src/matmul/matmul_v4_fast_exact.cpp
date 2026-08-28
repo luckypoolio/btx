@@ -4,6 +4,7 @@
 
 #include <matmul/matmul_v4_fast_exact.h>
 
+#include <cstddef>
 #include <limits>
 
 namespace matmul::v4::fast_exact {

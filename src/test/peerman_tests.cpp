@@ -7342,6 +7342,76 @@ BOOST_AUTO_TEST_CASE(best_header_below_tip_rerequests_headers_and_converges)
     peerman.ResetMatMulVerifyAdmissionForTest();
 }
 
+BOOST_AUTO_TEST_CASE(fresh_discovery_owner_yields_root_to_advertised_block_source)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    ResetSharedPeermanFixture(m_node);
+    ChainstateManager& chainman{*Assert(m_node.chainman)};
+    PeerManager& peerman{*Assert(m_node.peerman)};
+    ConnmanTestMsg& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    const CBlockIndex* const tip{
+        WITH_LOCK(::cs_main, return chainman.ActiveChain().Tip())};
+    BOOST_REQUIRE(tip != nullptr);
+
+    CBlockIndex* const hole{MakePeermanHeaderChild(chainman, *tip, 0xf1)};
+    const uint256 hole_hash{hole->GetBlockHash()};
+    const ServiceFlags discovery_services{ServiceFlags(
+        NODE_WITNESS | NODE_MATMUL_CONSENSUS | NODE_MATMUL_DISCOVERY)};
+    const ServiceFlags full_services{ServiceFlags(
+        NODE_NETWORK | NODE_WITNESS | NODE_MATMUL_CONSENSUS)};
+
+    CNode discovery{/*id=*/5001, /*sock=*/nullptr, CAddress{}, 5001, 0,
+                    CAddress{}, "discovery-only-owner",
+                    ConnectionType::MANUAL, false, 0};
+    CNode full{/*id=*/5002, /*sock=*/nullptr, CAddress{}, 5002, 0,
+               CAddress{}, "advertised-block-source",
+               ConnectionType::OUTBOUND_FULL_RELAY, false, 0};
+    connman.Handshake(discovery, /*successfully_connected=*/true,
+                      discovery_services, discovery_services, PROTOCOL_VERSION,
+                      /*relay_txs=*/true, tip->nHeight + 1);
+    connman.Handshake(full, /*successfully_connected=*/true, full_services,
+                      full_services, PROTOCOL_VERSION, /*relay_txs=*/true,
+                      tip->nHeight + 1);
+    connman.FlushSendBuffer(discovery);
+    connman.FlushSendBuffer(full);
+
+    auto feed_header = [&](CNode& peer) {
+        std::vector<CBlock> headers{CBlock{hole->GetBlockHeader()}};
+        BOOST_REQUIRE(connman.ReceiveMsgFrom(
+            peer, NetMsg::Make(NetMsgType::HEADERS, TX_WITH_WITNESS(headers))));
+        peer.fPauseSend = false;
+        (void)connman.ProcessMessagesOnce(peer);
+    };
+
+    // Configured GPU peers remain a legacy fallback even without a block
+    // service bit, so this fresh request initially belongs to discovery.
+    feed_header(discovery);
+    BOOST_CHECK(peerman.SendMessages(&discovery));
+    CNodeStateStats discovery_before;
+    BOOST_REQUIRE(peerman.GetNodeStateStats(discovery.GetId(), discovery_before));
+    BOOST_REQUIRE_MESSAGE(!discovery_before.vHeightInFlight.empty(),
+                          "test setup: discovery peer must own the fresh root");
+    connman.FlushSendBuffer(discovery);
+
+    // A peer explicitly advertising block service must take the canonical
+    // first hole immediately, without waiting for the fresh owner to time out.
+    feed_header(full);
+    BOOST_CHECK(peerman.SendMessages(&full));
+    CNodeStateStats discovery_after;
+    CNodeStateStats full_after;
+    BOOST_REQUIRE(peerman.GetNodeStateStats(discovery.GetId(), discovery_after));
+    BOOST_REQUIRE(peerman.GetNodeStateStats(full.GetId(), full_after));
+    BOOST_CHECK(discovery_after.vHeightInFlight.empty());
+    BOOST_REQUIRE_MESSAGE(!full_after.vHeightInFlight.empty(),
+                          "advertised block source must own the root request");
+    BOOST_CHECK_EQUAL(CountQueuedGetDataForHash(full, hole_hash), 1U);
+
+    peerman.FinalizeNode(discovery);
+    peerman.FinalizeNode(full);
+    NeutralizeUnconnectedHeaders(chainman);
+    peerman.ResetMatMulVerifyAdmissionForTest();
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 // Fresh RegTestingSetup is genesis (tip=0), matching the 2026-08-26 field
