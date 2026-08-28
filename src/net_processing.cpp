@@ -1070,6 +1070,9 @@ struct CNodeState {
     uint64_t m_keyed_netgroup{0};
     //! The best known block we know this peer has announced.
     const CBlockIndex* pindexBestKnownBlock{nullptr};
+    //! Highest indexed block directly announced or delivered by this peer.
+    //! Unlike pindexBestKnownBlock, signed-frontier seeding never changes it.
+    const CBlockIndex* pindexBestAnnouncedBlock{nullptr};
     //! The hash of the last unknown block this peer has announced.
     uint256 hashLastUnknownBlock{};
     //! The last full block we both have.
@@ -2135,9 +2138,9 @@ private:
         std::chrono::microseconds stale_after) const
         EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
-    /** True when any current owner advertised NODE_NETWORK or
-     *  NODE_NETWORK_LIMITED during VERSION. */
-    bool BlockInFlightHasAdvertisedBlockSource(const uint256& hash) const
+    /** True when any current owner advertised block service and directly
+     *  announced a chain containing this block. */
+    bool BlockInFlightHasAdvertisedBlockSource(const CBlockIndex& block) const
         EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     /** Have we requested this block from an outbound peer */
@@ -2594,7 +2597,9 @@ private:
     /** Check whether the last unknown block a peer advertised is not yet known. */
     void ProcessBlockAvailability(NodeId nodeid) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     /** Update tracking information about which blocks a peer is assumed to have. */
-    void UpdateBlockAvailability(NodeId nodeid, const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    void UpdateBlockAvailability(NodeId nodeid, const uint256& hash,
+                                 bool body_source_evidence = true)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     bool CanDirectFetch() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     /**
@@ -2859,12 +2864,20 @@ bool PeerManagerImpl::BlockInFlightFullyStale(const uint256& hash,
     return true;
 }
 
-bool PeerManagerImpl::BlockInFlightHasAdvertisedBlockSource(const uint256& hash) const
+bool PeerManagerImpl::BlockInFlightHasAdvertisedBlockSource(const CBlockIndex& block) const
 {
-    const auto range{mapBlocksInFlight.equal_range(hash)};
+    const auto range{mapBlocksInFlight.equal_range(block.GetBlockHash())};
     for (auto it{range.first}; it != range.second; ++it) {
         const CNodeState* const owner{State(it->second.first)};
-        if (owner != nullptr && owner->m_can_serve_blocks) return true;
+        if (owner == nullptr || !owner->m_can_serve_blocks ||
+            owner->pindexBestAnnouncedBlock == nullptr ||
+            owner->pindexBestAnnouncedBlock->nHeight < block.nHeight) {
+            continue;
+        }
+        if (owner->pindexBestAnnouncedBlock->GetAncestor(block.nHeight) ==
+            &block) {
+            return true;
+        }
     }
     return false;
 }
@@ -4457,7 +4470,8 @@ void PeerManagerImpl::ProcessBlockAvailability(NodeId nodeid) {
     }
 }
 
-void PeerManagerImpl::UpdateBlockAvailability(NodeId nodeid, const uint256 &hash) {
+void PeerManagerImpl::UpdateBlockAvailability(NodeId nodeid, const uint256& hash,
+                                              bool body_source_evidence) {
     CNodeState *state = State(nodeid);
     assert(state != nullptr);
 
@@ -4465,6 +4479,12 @@ void PeerManagerImpl::UpdateBlockAvailability(NodeId nodeid, const uint256 &hash
 
     const CBlockIndex* pindex = m_chainman.m_blockman.LookupBlockIndex(hash);
     if (pindex && pindex->nChainWork > 0) {
+        if (body_source_evidence &&
+            (state->pindexBestAnnouncedBlock == nullptr ||
+             pindex->nChainWork >=
+                 state->pindexBestAnnouncedBlock->nChainWork)) {
+            state->pindexBestAnnouncedBlock = pindex;
+        }
         // Trusted mirrors must not let ordinary competing-branch tips displace a
         // tip-chain best-known pointer (unattestable bodies starve authority
         // catch-up). Attestation-authority peers are the exception: after a
@@ -4799,9 +4819,17 @@ void PeerManagerImpl::FindNextBlocksToDownload(const Peer& peer, unsigned int co
             root_first.lowest_missing->GetBlockHash())) {
         const uint256 hole{root_first.lowest_missing->GetBlockHash()};
         const bool requested{IsBlockRequested(hole)};
+        const bool peer_announced_hole{
+            state->pindexBestAnnouncedBlock != nullptr &&
+            state->pindexBestAnnouncedBlock->nHeight >=
+                root_first.lowest_missing->nHeight &&
+            state->pindexBestAnnouncedBlock->GetAncestor(
+                root_first.lowest_missing->nHeight) ==
+                root_first.lowest_missing};
         const bool prefer_advertised_source{
-            CanServeBlocks(peer) && requested &&
-            !BlockInFlightHasAdvertisedBlockSource(hole)};
+            CanServeBlocks(peer) && peer_announced_hole && requested &&
+            !BlockInFlightHasAdvertisedBlockSource(
+                *root_first.lowest_missing)};
         const bool stale_reassign{
             node::matmul_trusted::CanonicalFirstHoleMayReassign(
                 requested,
@@ -17162,7 +17190,9 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
                     avail != nullptr &&
                     (avail->nStatus & BLOCK_FAILED_MASK) != 0};
                 if (!header_failed && State(pfrom.GetId()) != nullptr) {
-                    UpdateBlockAvailability(pfrom.GetId(), hash);
+                    UpdateBlockAvailability(
+                        pfrom.GetId(), hash,
+                        /*body_source_evidence=*/false);
                 }
                 wake_block_fetch = !header_failed;
             }

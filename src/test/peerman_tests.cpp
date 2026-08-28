@@ -7363,16 +7363,23 @@ BOOST_AUTO_TEST_CASE(fresh_discovery_owner_yields_root_to_advertised_block_sourc
     CNode discovery{/*id=*/5001, /*sock=*/nullptr, CAddress{}, 5001, 0,
                     CAddress{}, "discovery-only-owner",
                     ConnectionType::MANUAL, false, 0};
-    CNode full{/*id=*/5002, /*sock=*/nullptr, CAddress{}, 5002, 0,
+    CNode stale_full{/*id=*/5002, /*sock=*/nullptr, CAddress{}, 5002, 0,
+                     CAddress{}, "seeded-but-unproven-block-source",
+                     ConnectionType::MANUAL, false, 0};
+    CNode full{/*id=*/5003, /*sock=*/nullptr, CAddress{}, 5003, 0,
                CAddress{}, "advertised-block-source",
                ConnectionType::OUTBOUND_FULL_RELAY, false, 0};
     connman.Handshake(discovery, /*successfully_connected=*/true,
                       discovery_services, discovery_services, PROTOCOL_VERSION,
                       /*relay_txs=*/true, tip->nHeight + 1);
+    connman.Handshake(stale_full, /*successfully_connected=*/true,
+                      full_services, full_services, PROTOCOL_VERSION,
+                      /*relay_txs=*/true, tip->nHeight);
     connman.Handshake(full, /*successfully_connected=*/true, full_services,
                       full_services, PROTOCOL_VERSION, /*relay_txs=*/true,
                       tip->nHeight + 1);
     connman.FlushSendBuffer(discovery);
+    connman.FlushSendBuffer(stale_full);
     connman.FlushSendBuffer(full);
 
     auto feed_header = [&](CNode& peer) {
@@ -7393,8 +7400,22 @@ BOOST_AUTO_TEST_CASE(fresh_discovery_owner_yields_root_to_advertised_block_sourc
                           "test setup: discovery peer must own the fresh root");
     connman.FlushSendBuffer(discovery);
 
+    // A manual full-service peer can be locally seeded to the followed
+    // frontier even though VERSION says it stopped below the hole. That seed
+    // is routing state, not evidence that the peer has the body.
+    BOOST_CHECK(peerman.SendMessages(&stale_full));
+    CNodeStateStats stale_full_stats;
+    CNodeStateStats discovery_after_stale;
+    BOOST_REQUIRE(peerman.GetNodeStateStats(stale_full.GetId(), stale_full_stats));
+    BOOST_REQUIRE(peerman.GetNodeStateStats(discovery.GetId(), discovery_after_stale));
+    BOOST_CHECK_EQUAL(stale_full_stats.nSyncHeight, hole->nHeight);
+    BOOST_CHECK(stale_full_stats.vHeightInFlight.empty());
+    BOOST_CHECK(!discovery_after_stale.vHeightInFlight.empty());
+    BOOST_CHECK_EQUAL(CountQueuedGetDataForHash(stale_full, hole_hash), 0U);
+
     // A peer explicitly advertising block service must take the canonical
-    // first hole immediately, without waiting for the fresh owner to time out.
+    // first hole immediately after it directly announces the chain, without
+    // waiting for the fresh owner to time out.
     feed_header(full);
     BOOST_CHECK(peerman.SendMessages(&full));
     CNodeStateStats discovery_after;
@@ -7407,6 +7428,7 @@ BOOST_AUTO_TEST_CASE(fresh_discovery_owner_yields_root_to_advertised_block_sourc
     BOOST_CHECK_EQUAL(CountQueuedGetDataForHash(full, hole_hash), 1U);
 
     peerman.FinalizeNode(discovery);
+    peerman.FinalizeNode(stale_full);
     peerman.FinalizeNode(full);
     NeutralizeUnconnectedHeaders(chainman);
     peerman.ResetMatMulVerifyAdmissionForTest();
