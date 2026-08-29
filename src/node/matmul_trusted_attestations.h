@@ -2568,6 +2568,22 @@ static constexpr auto GPU_RETAIN_ATTESTATION_RETRY{std::chrono::seconds{2}};
            manual || noban;
 }
 
+/** HEADER_ONLY / signed-frontier seeding proves which chain to follow, not that
+ *  this peer stores its next missing body. While a real header tower is ahead,
+ *  require either VERSION evidence that the peer had tip+1 at connect or an
+ *  observed body from this connection. Outside tower catch-up this is a no-op. */
+[[nodiscard]] inline bool StalledTowerPeerHasBodyAvailabilityEvidence(
+    bool behind_header_tower,
+    int starting_height,
+    int next_needed_height,
+    bool has_served_block)
+{
+    if (!behind_header_tower) return true;
+    if (has_served_block) return true;
+    return starting_height >= 0 && next_needed_height >= 0 &&
+           starting_height >= next_needed_height;
+}
+
 /** Root-first must not delete a fresh GETDATA because a second peer is
  *  eligible as a parallel owner. Live public CPU archive 2026-08-16: MayDuplicate
  *  (owners<2) called RemoveBlockRequest(nullopt); the GPU BLOCK then

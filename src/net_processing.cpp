@@ -21494,6 +21494,19 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
         // handshake advertising height>tip absorbed GETDATA and replied
         // notfound/ignore -- a zero-PoW catch-up-starvation DoS. GPU
         // authorities are still eligible even if VERSION omitted NODE_NETWORK.
+        const bool behind_header_tower{
+            tip_for_headers != nullptr && m_chainman.m_best_header != nullptr &&
+            m_chainman.m_best_header->nHeight - tip_for_headers->nHeight >=
+                BLOCK_FETCH_STALL_HEADERS_AHEAD};
+        const int next_needed_height{
+            tip_for_headers != nullptr ? tip_for_headers->nHeight + 1 : -1};
+        const int peer_starting_height{
+            state.m_starting_height >= 0 ? state.m_starting_height
+                                         : peer->m_starting_height.load()};
+        const bool peer_has_body_availability_evidence{
+            node::matmul_trusted::StalledTowerPeerHasBodyAvailabilityEvidence(
+                behind_header_tower, peer_starting_height, next_needed_height,
+                state.m_has_served_block)};
         const bool peer_may_serve_bodies{
             node::matmul_trusted::StalledTowerFetchPeerMayServeBodies(
                 PeerIsGpuAuthority(pto->GetId(), state),
@@ -21501,7 +21514,8 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                 /*version_handshake_complete=*/
                 peer->m_starting_height.load() >= 0,
                 pto->IsManualConn(),
-                pto->HasPermission(NetPermissionFlags::NoBan))};
+                pto->HasPermission(NetPermissionFlags::NoBan)) &&
+            peer_has_body_availability_evidence};
         const bool drive_stalled_tower_fetch{
             stalled_behind_header_tower &&
             !m_chainman.m_blockman.LoadingBlocks() &&
@@ -21515,10 +21529,6 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
         // block/min behind a 400+ block tower. This fires whenever we are
         // behind the followed header tower, the peer can serve bodies, and it
         // has spare per-peer capacity, bounded by BLOCK_DOWNLOAD_WINDOW.
-        const bool behind_header_tower{
-            tip_for_headers != nullptr && m_chainman.m_best_header != nullptr &&
-            m_chainman.m_best_header->nHeight - tip_for_headers->nHeight >=
-                BLOCK_FETCH_STALL_HEADERS_AHEAD};
         const bool spread_catchup_fetch{
             !m_chainman.m_blockman.LoadingBlocks() &&
             !pto->IsAddrFetchConn() &&
@@ -21533,6 +21543,7 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                 PeerIsGpuAuthority(pto->GetId(), state),
                 CanServeBlocks(*peer),
                 /*version_handshake_complete=*/peer->m_starting_height.load() >= 0) &&
+            peer_has_body_availability_evidence &&
             PeerMaySignedFrontierCatchUpGetData(*peer, state) &&
             can_request_blocks_from_peer &&
             ShouldRequestBlocksFromMatMulPeer(
@@ -21563,7 +21574,9 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                 // reason -- doing so mislabels every skip on a node with
                 // ineligible peers and sent one investigation down the wrong
                 // path. Report it only as a trailing hint.
-                const char* reason = !node::matmul_trusted::TrustedMirrorGpuMayServeBlocks(
+                const char* reason = !peer_has_body_availability_evidence
+                    ? "no_body_availability_evidence"
+                    : !node::matmul_trusted::TrustedMirrorGpuMayServeBlocks(
                     PeerIsGpuAuthority(pto->GetId(), state), CanServeBlocks(*peer),
                     /*version_handshake_complete=*/peer->m_starting_height.load() >= 0)
                     ? "cannot_serve_blocks"

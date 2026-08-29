@@ -1993,6 +1993,18 @@ BOOST_AUTO_TEST_CASE(above_frontier_and_parked_branch_do_not_admit)
     // Handshake-incomplete peer is never a target even if it would serve.
     BOOST_CHECK(!StalledTowerFetchPeerMayServeBodies(
         true, true, /*version_handshake_complete=*/false, false, false));
+    using node::matmul_trusted::StalledTowerPeerHasBodyAvailabilityEvidence;
+    // A seeded BestKnown must not let an old, unproven peer absorb tip+1.
+    BOOST_CHECK(!StalledTowerPeerHasBodyAvailabilityEvidence(
+        /*behind_header_tower=*/true, /*starting_height=*/199294,
+        /*next_needed_height=*/203885, /*has_served_block=*/false));
+    BOOST_CHECK(StalledTowerPeerHasBodyAvailabilityEvidence(
+        true, /*starting_height=*/203954, /*next_needed_height=*/203885, false));
+    BOOST_CHECK(StalledTowerPeerHasBodyAvailabilityEvidence(
+        true, /*starting_height=*/199294, /*next_needed_height=*/203885,
+        /*has_served_block=*/true));
+    BOOST_CHECK(StalledTowerPeerHasBodyAvailabilityEvidence(
+        /*behind_header_tower=*/false, -1, 203885, false));
     using node::matmul_trusted::TrustedMirrorKeepFetchingCoveredUnconnected;
     BOOST_CHECK(TrustedMirrorKeepFetchingCoveredUnconnected(
         /*signed_frontier_catch_up=*/true,
