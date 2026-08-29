@@ -2740,17 +2740,18 @@ BOOST_AUTO_TEST_CASE(competing_attested_index_rejects_fossil_depth)
         false, true, 104, 100, kNearTip, false));
     BOOST_CHECK(IndependentConsensusMaySpendExactReplayGpu(
         false, true, 199380, 199378, kNearTip, false));
-    // A high followed-chain body must wait until its parent is active or
-    // ExactReplay-verified. Attestation coverage does not bypass ordering.
+    // A high followed-chain body must wait until its parent is active. An old
+    // floating verified island must not bypass the missing root, and neither
+    // may attestation coverage.
     BOOST_CHECK(!IndependentConsensusMaySpendExactReplayGpu(
         false, true, 104, 100, kNearTip, false, /*on_parked=*/false,
-        /*parent_connectable=*/false));
+        /*parent_on_active_chain=*/false));
     BOOST_CHECK(!IndependentConsensusMaySpendExactReplayGpu(
         false, true, 104, 100, kNearTip, /*covered_by_attestation=*/true,
-        /*on_parked=*/false, /*parent_connectable=*/false));
+        /*on_parked=*/false, /*parent_on_active_chain=*/false));
     BOOST_CHECK(IndependentConsensusMaySpendExactReplayGpu(
         false, true, 104, 100, kNearTip, false, /*on_parked=*/false,
-        /*parent_connectable=*/true));
+        /*parent_on_active_chain=*/true));
     // Immediate unattested tip-child stays off this helper (twin storm).
     // ClaimConfigured / ConsensusMayClaimUnattestedTipChildBody owns it.
     BOOST_CHECK(!IndependentConsensusMaySpendExactReplayGpu(

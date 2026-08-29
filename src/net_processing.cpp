@@ -5186,7 +5186,8 @@ static bool TrustedMirrorMayDownloadIndex(
         index->pprev == tip, on_or_extends_tip, index->nHeight, tip->nHeight,
         MATMUL_RC_NEAR_TIP_DEPTH, covered,
         chainman.IsOnParkedReorgBranch(index),
-        AcquiredBodyParentConnectable(chainman, index));
+        index->pprev != nullptr &&
+            chainman.ActiveChain().Contains(index->pprev));
 }
 
 static bool AuthorityFrontierIndexUsable(

@@ -603,9 +603,11 @@ static constexpr auto GETMMATTEST_HISTORICAL_TOKEN_REFILL{std::chrono::seconds{4
  *  Catch-up (a live consensus-archive node 2026-08-29): a consensus node that
  *  is merely behind must ExactReplay bodies ABOVE its connected tip. Admit
  *  them root-first: a floating descendant cannot spend the only GPU slot until
- *  its parent is active or already ExactReplay-verified with data. Otherwise a
- *  freshly received high body can repeatedly starve tip+1 while the followed
- *  suffix is persisted for later ConnectTip replay. `on_or_extends_active_tip`
+ *  its parent is on the active chain. A merely ExactReplay-verified floating
+ *  parent is insufficient because older builds may have left disconnected
+ *  verified islands above a missing tip+1. Otherwise a freshly received high
+ *  body can repeatedly starve tip+1 while the followed suffix is persisted for
+ *  later ConnectTip replay. `on_or_extends_active_tip`
  *  is computed as GetAncestor(tip)==tip (or the index is already an ancestor
  *  of the tip). Unattested non-extending forks stay off. */
 [[nodiscard]] inline bool IndependentConsensusMaySpendExactReplayGpu(
@@ -616,16 +618,16 @@ static constexpr auto GETMMATTEST_HISTORICAL_TOKEN_REFILL{std::chrono::seconds{4
     int32_t near_tip_depth,
     bool covered_by_attestation,
     bool on_parked = false,
-    bool parent_connectable = true)
+    bool parent_on_active_chain = true)
 {
     // Parked dump-and-run branches must not re-occupy the device after
     // ActivateBestChain already refused the rewrite.
     if (on_parked) return false;
     // Catch-up bodies above the connected tip must consume ExactReplay in
-    // parent order. Coverage authenticates a hash; it does not make a floating
-    // descendant connectable.
+    // active-parent order. Coverage authenticates a hash; it does not make a
+    // floating descendant connectable.
     if (on_or_extends_active_tip && index_height > tip_height &&
-        !parent_connectable) return false;
+        !parent_on_active_chain) return false;
     if (covered_by_attestation) return true;
     // Unattested pprev==tip is the twin storm. Do not ExactReplay a
     // competing sibling just because it extends the tip.
