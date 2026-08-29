@@ -641,6 +641,21 @@ static constexpr auto GETMMATTEST_HISTORICAL_TOKEN_REFILL{std::chrono::seconds{4
     return false;
 }
 
+/** A retained-body retry normally preserves the original request flag. The
+ *  parent-connectable root of an acquired heavier tower is the exception: its
+ *  first delivery may have been unsolicited, but the root-first scheduler has
+ *  now explicitly selected it for validation. Treat only that bounded root as
+ *  requested so AcceptBlock does not discard the retained body at the
+ *  unrequested lower-work gate before ExactReplay can run. */
+[[nodiscard]] inline bool RetainedAcquisitionRetryMustForceProcessing(
+    bool originally_requested,
+    bool acquisition_covered,
+    bool parent_connectable)
+{
+    return originally_requested ||
+           (acquisition_covered && parent_connectable);
+}
+
 /** Equal-work lost twin (live 2026-08-20 consensus node): unattested tip
  *  at H, attested sibling at H, signed frontier HEADER_ONLY at H+N.
  *  The winner's pprev is the LCA, not the current tip, so the local-signer

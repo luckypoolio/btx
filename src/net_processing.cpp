@@ -3679,6 +3679,19 @@ void PeerManagerImpl::RetryMatMulDeferredBodies()
     candidate_hash = retry->first;
     candidate = retry->second;
     if (!candidate.block) return;
+    bool retry_force_processing{candidate.force_processing};
+    {
+        LOCK(cs_main);
+        const CBlockIndex* const idx{
+            m_chainman.m_blockman.LookupBlockIndex(candidate_hash)};
+        const bool acquisition_covered{
+            idx != nullptr && m_chainman.AcquisitionEscapeCoversBlock(idx)};
+        retry_force_processing =
+            node::matmul_trusted::RetainedAcquisitionRetryMustForceProcessing(
+                candidate.force_processing, acquisition_covered,
+                acquisition_covered &&
+                    AcquiredBodyParentConnectable(m_chainman, idx));
+    }
     if (frontier_off_chain && candidate_hash != fork_child_hash) {
         bool allow{false};
         {
@@ -3722,7 +3735,7 @@ void PeerManagerImpl::RetryMatMulDeferredBodies()
             MatMulBlockAdmission admission;
             if (!AdmitMatMulBlockVerification(
                     *source, *candidate.block,
-                    candidate.force_processing,
+                    retry_force_processing,
                     candidate.min_pow_checked,
                     /*requires_expensive_verification=*/true,
                     candidate.is_ibd,
@@ -3748,7 +3761,7 @@ void PeerManagerImpl::RetryMatMulDeferredBodies()
                 static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::steady_clock::now() - candidate.stored_at).count()));
             ProcessBlock(*source, candidate.block,
-                         candidate.force_processing,
+                         retry_force_processing,
                          candidate.min_pow_checked, std::move(slot),
                          /*post_process=*/nullptr, admission,
                          /*is_retained_retry=*/true);
@@ -3758,7 +3771,7 @@ void PeerManagerImpl::RetryMatMulDeferredBodies()
              "Replaying budget-deferred body %s locally (source peer=%d gone)\n",
              candidate_hash.ToString(), candidate.source_peer);
     ProcessBlockSync(candidate.source_peer, /*node=*/nullptr, candidate.block,
-                     candidate.force_processing, candidate.min_pow_checked,
+                     retry_force_processing, candidate.min_pow_checked,
                      /*post_process=*/nullptr);
 }
 

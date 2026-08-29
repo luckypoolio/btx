@@ -2784,6 +2784,19 @@ BOOST_AUTO_TEST_CASE(competing_attested_index_rejects_fossil_depth)
         false, false, 191323, 191323, kNearTip, true, /*on_parked=*/true));
     BOOST_CHECK(!IndependentConsensusMaySpendExactReplayGpu(
         true, false, 101, 100, kNearTip, true, /*on_parked=*/true));
+    using node::matmul_trusted::RetainedAcquisitionRetryMustForceProcessing;
+    // A retained retry keeps an original GETDATA request. An unsolicited body
+    // is promoted only when it is the parent-connectable root of the bounded
+    // heavier tower; floating descendants and unrelated forks stay unforced.
+    BOOST_CHECK(RetainedAcquisitionRetryMustForceProcessing(
+        /*originally_requested=*/true, /*acquisition_covered=*/false,
+        /*parent_connectable=*/false));
+    BOOST_CHECK(!RetainedAcquisitionRetryMustForceProcessing(
+        false, false, true));
+    BOOST_CHECK(!RetainedAcquisitionRetryMustForceProcessing(
+        false, true, false));
+    BOOST_CHECK(RetainedAcquisitionRetryMustForceProcessing(
+        false, true, true));
     using node::matmul_trusted::ConsensusMaySpendExactReplayGpuForShortReorgForkChild;
     // Live 2026-08-20: unattested tip 195603 489884e4, attested sibling
     // b8971871 (LCA depth 1), signed frontier 195635 HEADER_ONLY.
