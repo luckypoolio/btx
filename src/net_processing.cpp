@@ -5185,7 +5185,8 @@ static bool TrustedMirrorMayDownloadIndex(
     return node::matmul_trusted::IndependentConsensusMaySpendExactReplayGpu(
         index->pprev == tip, on_or_extends_tip, index->nHeight, tip->nHeight,
         MATMUL_RC_NEAR_TIP_DEPTH, covered,
-        chainman.IsOnParkedReorgBranch(index));
+        chainman.IsOnParkedReorgBranch(index),
+        AcquiredBodyParentConnectable(chainman, index));
 }
 
 static bool AuthorityFrontierIndexUsable(
@@ -8049,7 +8050,13 @@ void PeerManagerImpl::BlockConnected(
     // Once a block is active, retained verification state for that hash is
     // terminal. This also cancels a live generation, preventing a late
     // callback or idle retry from re-admitting an already-connected body.
-    if (role != ChainstateRole::BACKGROUND) {
+    // Validation callbacks are asynchronous. A reorg may have removed this
+    // block before the callback runs, and a new lifecycle generation for the
+    // same hash may already exist. Only terminalize a block still active now.
+    const bool still_active{
+        role != ChainstateRole::BACKGROUND &&
+        WITH_LOCK(cs_main, return m_chainman.ActiveChain().Contains(pindex))};
+    if (still_active) {
         m_matmul_block_lifecycle.TerminalConnected(pindex->GetBlockHash());
     }
 

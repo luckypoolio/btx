@@ -600,16 +600,14 @@ static constexpr auto GETMMATTEST_HISTORICAL_TOKEN_REFILL{std::chrono::seconds{4
  *  an already-attested winner. Already-canonical near-tip holes stay
  *  on-device for IBD.
  *
- *  Catch-up (a live consensus-archive node 2026-08-29): a consensus node that is merely
- *  behind must ExactReplay bodies ABOVE its connected tip. The old upper
- *  bound (`index_height <= tip_height`) made that impossible, so
- *  MatMulMaySpendExactReplayGpu returned false, the followed-suffix
- *  persist hatch saw far_behind=0 (UncappedFollowedChainAhead ignores a
- *  competing twin on m_best_header), and HEADER_ONLY skip left
- *  inflight=0 / GPU 0% / digest_requests=0. `on_or_extends_active_tip`
- *  is computed as GetAncestor(tip)==tip (or the index is already an
- *  ancestor of the tip): the block builds on the connected chain, not a
- *  fork from below it. Unattested non-extending forks stay off. */
+ *  Catch-up (a live consensus-archive node 2026-08-29): a consensus node that
+ *  is merely behind must ExactReplay bodies ABOVE its connected tip. Admit
+ *  them root-first: a floating descendant cannot spend the only GPU slot until
+ *  its parent is active or already ExactReplay-verified with data. Otherwise a
+ *  freshly received high body can repeatedly starve tip+1 while the followed
+ *  suffix is persisted for later ConnectTip replay. `on_or_extends_active_tip`
+ *  is computed as GetAncestor(tip)==tip (or the index is already an ancestor
+ *  of the tip). Unattested non-extending forks stay off. */
 [[nodiscard]] inline bool IndependentConsensusMaySpendExactReplayGpu(
     bool pprev_is_tip,
     bool on_or_extends_active_tip,
@@ -617,11 +615,17 @@ static constexpr auto GETMMATTEST_HISTORICAL_TOKEN_REFILL{std::chrono::seconds{4
     int32_t tip_height,
     int32_t near_tip_depth,
     bool covered_by_attestation,
-    bool on_parked = false)
+    bool on_parked = false,
+    bool parent_connectable = true)
 {
     // Parked dump-and-run branches must not re-occupy the device after
     // ActivateBestChain already refused the rewrite.
     if (on_parked) return false;
+    // Catch-up bodies above the connected tip must consume ExactReplay in
+    // parent order. Coverage authenticates a hash; it does not make a floating
+    // descendant connectable.
+    if (on_or_extends_active_tip && index_height > tip_height &&
+        !parent_connectable) return false;
     if (covered_by_attestation) return true;
     // Unattested pprev==tip is the twin storm. Do not ExactReplay a
     // competing sibling just because it extends the tip.
