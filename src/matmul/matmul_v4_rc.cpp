@@ -2712,6 +2712,7 @@ uint256 RecomputeRCRoundRootAccelerated(const uint256& seed_r, const uint256& si
         /*stats=*/nullptr,
         /*require_device=*/true,
         output_row_tile,
+        /*profile=*/params.profile,
     };
     auto p1 = Phase1AssociativeRecall(
         seed_r, sigma, params, options.phase1_tile_delta, dispatch);
