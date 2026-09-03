@@ -696,7 +696,7 @@ struct RCMerkleProof {
 [[nodiscard]] uint256 RecomputeRCRoundRootAccelerated(
     const uint256& seed_r, const uint256& sigma, const RCEpisodeParams& params,
     const matmul::v4::lt::ExactGemmBackend& gemm, uint32_t output_row_tile,
-    const RCEpisodeOptions& options = {});
+    uint32_t profile, const RCEpisodeOptions& options = {});
 
 /** Spot-check verifier (R.5.3): recompute episode streams, open challenged
  *  Merkle leaves against round_roots. If challenged_leaves is empty, derive

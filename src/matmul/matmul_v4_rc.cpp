@@ -2702,7 +2702,7 @@ uint256 RecomputeRCRoundRoot(const uint256& seed_r, const uint256& sigma,
 uint256 RecomputeRCRoundRootAccelerated(const uint256& seed_r, const uint256& sigma,
                                         const RCEpisodeParams& params,
                                         const lt::ExactGemmBackend& gemm,
-                                        uint32_t output_row_tile,
+                                        uint32_t output_row_tile, uint32_t profile,
                                         const RCEpisodeOptions& options)
 {
     if (!ValidateRCEpisodeParams(params)) return uint256{};
@@ -2712,7 +2712,7 @@ uint256 RecomputeRCRoundRootAccelerated(const uint256& seed_r, const uint256& si
         /*stats=*/nullptr,
         /*require_device=*/true,
         output_row_tile,
-        /*profile=*/params.profile,
+        profile,
     };
     auto p1 = Phase1AssociativeRecall(
         seed_r, sigma, params, options.phase1_tile_delta, dispatch);
