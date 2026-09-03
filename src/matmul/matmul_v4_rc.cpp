@@ -2699,6 +2699,31 @@ uint256 RecomputeRCRoundRoot(const uint256& seed_r, const uint256& sigma,
                                  /*out_stream=*/nullptr);
 }
 
+uint256 RecomputeRCRoundRootAccelerated(const uint256& seed_r, const uint256& sigma,
+                                        const RCEpisodeParams& params,
+                                        const lt::ExactGemmBackend& gemm,
+                                        uint32_t output_row_tile,
+                                        const RCEpisodeOptions& options)
+{
+    if (!ValidateRCEpisodeParams(params)) return uint256{};
+    if (gemm.gemm_s8s8 == nullptr) return uint256{};
+    RCGemmDispatch dispatch{
+        gemm,
+        /*stats=*/nullptr,
+        /*require_device=*/true,
+        output_row_tile,
+    };
+    auto p1 = Phase1AssociativeRecall(
+        seed_r, sigma, params, options.phase1_tile_delta, dispatch);
+    if (!p1.ok) return uint256{};
+    auto p2 = Phase2MicroTraining(
+        seed_r, sigma, params, options.checkpoint, dispatch);
+    if (!p2.ok) return uint256{};
+    RoundMerkleStream merkle(params.T_leaf, gemm.rc_merkle_leaves, gemm.rc_merkle_root);
+    return StreamRoundIntoMerkle(p1, p2, params, options.checkpoint, dispatch, merkle,
+                                 /*out_stream=*/nullptr);
+}
+
 bool VerifyRCTranscriptSpotCheck(const CBlockHeader& header, const RCEpisodeParams& params,
                                  int32_t height, const uint256& claimed_digest,
                                  const std::vector<uint32_t>& challenged_leaves,

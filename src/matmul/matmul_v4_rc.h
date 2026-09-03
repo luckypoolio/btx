@@ -686,6 +686,18 @@ struct RCMerkleProof {
                                            const RCEpisodeOptions& options = {},
                                            const matmul::v4::lt::ExactGemmBackend& gemm = {});
 
+/** Pool-side spot-check variant of RecomputeRCRoundRoot. Same round body and
+ *  byte-identical root, but dispatched the way the measurement harness runs a
+ *  device episode: every contraction must land on the qualified exact backend
+ *  (require_device), FFN output rows are tiled by output_row_tile, and leaf
+ *  hashing / root folding use the backend's Merkle lanes when present. Never
+ *  for consensus; a missing device lane returns a null root instead of
+ *  silently falling back to the host reference. */
+[[nodiscard]] uint256 RecomputeRCRoundRootAccelerated(
+    const uint256& seed_r, const uint256& sigma, const RCEpisodeParams& params,
+    const matmul::v4::lt::ExactGemmBackend& gemm, uint32_t output_row_tile,
+    const RCEpisodeOptions& options = {});
+
 /** Spot-check verifier (R.5.3): recompute episode streams, open challenged
  *  Merkle leaves against round_roots. If challenged_leaves is empty, derive
  *  q=kRCSpotCheckQueries flat leaf indices via Fiat–Shamir
