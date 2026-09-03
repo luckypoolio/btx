@@ -411,6 +411,156 @@ struct DeviceBuf {
     }
 };
 
+__device__ __forceinline__ void ErShaStateToBytes(
+    const uint32_t state[8], unsigned char out[32])
+{
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) {
+        out[i * 4] = static_cast<unsigned char>(state[i] >> 24);
+        out[i * 4 + 1] = static_cast<unsigned char>(state[i] >> 16);
+        out[i * 4 + 2] = static_cast<unsigned char>(state[i] >> 8);
+        out[i * 4 + 3] = static_cast<unsigned char>(state[i]);
+    }
+}
+
+__device__ __forceinline__ unsigned char ErTaggedMessageByte(
+    const unsigned char* payload, size_t position, unsigned char tag)
+{
+    return position == 0 ? tag : payload[position - 1];
+}
+
+__device__ void ErSha256dTaggedPayload(
+    const unsigned char* payload, uint32_t payload_bytes,
+    unsigned char tag, unsigned char out[32])
+{
+    const size_t message_bytes = static_cast<size_t>(payload_bytes) + 1;
+    const size_t full_blocks = message_bytes / 64;
+    uint32_t state[8];
+    matmul_v4::lt_device::ShaInit(state);
+
+    for (size_t block_index = 0; block_index < full_blocks; ++block_index) {
+        uint32_t block[16]{};
+        const size_t base = block_index * 64;
+#pragma unroll
+        for (uint32_t i = 0; i < 64; ++i) {
+            matmul_v4::lt_device::ShaSetByte(
+                block, i, ErTaggedMessageByte(payload, base + i, tag));
+        }
+        matmul_v4::lt_device::ShaCompress(state, block);
+    }
+
+    const uint32_t remainder = static_cast<uint32_t>(message_bytes & 63U);
+    uint32_t tail[16]{};
+    const size_t tail_base = full_blocks * 64;
+    for (uint32_t i = 0; i < remainder; ++i) {
+        matmul_v4::lt_device::ShaSetByte(
+            tail, i, ErTaggedMessageByte(payload, tail_base + i, tag));
+    }
+    matmul_v4::lt_device::ShaSetByte(tail, remainder, 0x80U);
+    if (remainder >= 56) {
+        matmul_v4::lt_device::ShaCompress(state, tail);
+#pragma unroll
+        for (uint32_t& word : tail) word = 0;
+    }
+    const uint64_t bit_length = static_cast<uint64_t>(message_bytes) * 8;
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) {
+        matmul_v4::lt_device::ShaSetByte(
+            tail, 56 + i,
+            static_cast<unsigned char>(bit_length >> ((7 - i) * 8)));
+    }
+    matmul_v4::lt_device::ShaCompress(state, tail);
+
+    unsigned char first[32];
+    ErShaStateToBytes(state, first);
+    uint32_t second[16]{};
+#pragma unroll
+    for (uint32_t i = 0; i < 32; ++i) {
+        matmul_v4::lt_device::ShaSetByte(second, i, first[i]);
+    }
+    matmul_v4::lt_device::ShaSetByte(second, 32, 0x80U);
+    second[15] = 32U * 8U;
+    matmul_v4::lt_device::ShaInit(state);
+    matmul_v4::lt_device::ShaCompress(state, second);
+    ErShaStateToBytes(state, out);
+}
+
+__global__ void ErSha256dTaggedRecordsKernel(
+    const unsigned char* payloads, uint32_t payload_bytes,
+    size_t record_count, unsigned char tag, unsigned char* hashes)
+{
+    const size_t record =
+        static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (record >= record_count) return;
+    ErSha256dTaggedPayload(
+        payloads + record * payload_bytes, payload_bytes, tag,
+        hashes + record * 32);
+}
+
+struct RcMerkleCudaWorkspace {
+    DeviceBuf payload;
+    DeviceBuf hashes_a;
+    DeviceBuf hashes_b;
+    cudaStream_t stream{nullptr};
+    int device_index{-1};
+
+    void Reset()
+    {
+        if (stream) cudaStreamDestroy(stream);
+        stream = nullptr;
+        (void)payload.Alloc(0);
+        (void)hashes_a.Alloc(0);
+        (void)hashes_b.Alloc(0);
+        device_index = -1;
+    }
+
+    ~RcMerkleCudaWorkspace()
+    {
+        if (device_index >= 0) (void)cudaSetDevice(device_index);
+        Reset();
+    }
+
+    [[nodiscard]] bool Ensure(
+        size_t payload_capacity, size_t hash_capacity,
+        int selected_device)
+    {
+        if (device_index != selected_device) {
+            if (device_index >= 0) {
+                if (cudaSetDevice(device_index) != cudaSuccess) return false;
+                Reset();
+            }
+            if (cudaSetDevice(selected_device) != cudaSuccess) return false;
+            device_index = selected_device;
+        }
+        if (stream && cudaStreamSynchronize(stream) != cudaSuccess) return false;
+        if (!stream &&
+            cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
+            return false;
+        }
+        return payload.Alloc(payload_capacity) &&
+            hashes_a.Alloc(hash_capacity) &&
+            hashes_b.Alloc(hash_capacity);
+    }
+};
+
+std::mutex g_merkle_ws_mu;
+RcMerkleCudaWorkspace g_merkle_ws;
+
+[[nodiscard]] bool LaunchTaggedHashRecords(
+    const unsigned char* device_payloads, uint32_t payload_bytes,
+    size_t record_count, unsigned char tag,
+    unsigned char* device_hashes, cudaStream_t stream)
+{
+    if (record_count == 0) return true;
+    constexpr uint32_t threads{128};
+    const size_t grid = (record_count + threads - 1) / threads;
+    if (grid > std::numeric_limits<uint32_t>::max()) return false;
+    ErSha256dTaggedRecordsKernel<<<
+        static_cast<uint32_t>(grid), threads, 0, stream>>>(
+            device_payloads, payload_bytes, record_count, tag, device_hashes);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
 struct RcExpandSeed32 {
     uint8_t bytes[32];
 };
@@ -2179,6 +2329,89 @@ bool LaunchRcExactReplayPhase1Seeded(
     return TryCudaRcPhase1AssociativeRecall(
         empty, empty, empty, prf_s, prf_z, query_rows, context_rows,
         d_head, out_z, &seed_q, &seed_k, &seed_v);
+}
+
+bool LaunchRcExactReplayMerkleLeaves(
+    const unsigned char* leaf_payloads, uint32_t leaf_bytes,
+    size_t leaf_count, std::vector<uint256>& leaf_hashes)
+{
+    leaf_hashes.clear();
+    if (leaf_count == 0) return true;
+    if (leaf_payloads == nullptr || leaf_bytes == 0 ||
+        leaf_count > std::numeric_limits<size_t>::max() / leaf_bytes ||
+        leaf_count > std::numeric_limits<size_t>::max() / 32) {
+        return false;
+    }
+    const size_t payload_size{leaf_count * leaf_bytes};
+    const size_t hash_size{leaf_count * 32};
+    std::lock_guard<std::mutex> lock{g_merkle_ws_mu};
+    int selected_device{-1};
+    if (!BindSelectedRcCudaDevice(&selected_device) ||
+        !g_merkle_ws.Ensure(payload_size, hash_size, selected_device)) {
+        return false;
+    }
+    if (cudaMemcpyAsync(
+            g_merkle_ws.payload.p, leaf_payloads, payload_size,
+            cudaMemcpyHostToDevice, g_merkle_ws.stream) != cudaSuccess ||
+        !LaunchTaggedHashRecords(
+            g_merkle_ws.payload.As<unsigned char>(), leaf_bytes,
+            leaf_count, 0x00, g_merkle_ws.hashes_a.As<unsigned char>(),
+            g_merkle_ws.stream)) {
+        return false;
+    }
+    static_assert(sizeof(uint256) == 32);
+    leaf_hashes.resize(leaf_count);
+    if (cudaMemcpyAsync(
+            leaf_hashes.data(), g_merkle_ws.hashes_a.p, hash_size,
+            cudaMemcpyDeviceToHost, g_merkle_ws.stream) != cudaSuccess ||
+        cudaStreamSynchronize(g_merkle_ws.stream) != cudaSuccess) {
+        leaf_hashes.clear();
+        return false;
+    }
+    return true;
+}
+
+bool LaunchRcExactReplayMerkleRoot(
+    const std::vector<uint256>& leaf_hashes, uint256& root)
+{
+    root.SetNull();
+    if (leaf_hashes.empty() ||
+        (leaf_hashes.size() & (leaf_hashes.size() - 1)) != 0 ||
+        leaf_hashes.size() > std::numeric_limits<size_t>::max() / 32) {
+        return false;
+    }
+    const size_t hash_size{leaf_hashes.size() * 32};
+    std::lock_guard<std::mutex> lock{g_merkle_ws_mu};
+    int selected_device{-1};
+    if (!BindSelectedRcCudaDevice(&selected_device) ||
+        !g_merkle_ws.Ensure(hash_size, hash_size, selected_device) ||
+        cudaMemcpyAsync(
+            g_merkle_ws.hashes_a.p, leaf_hashes.data(), hash_size,
+            cudaMemcpyHostToDevice, g_merkle_ws.stream) != cudaSuccess) {
+        return false;
+    }
+
+    unsigned char* current{g_merkle_ws.hashes_a.As<unsigned char>()};
+    unsigned char* next{g_merkle_ws.hashes_b.As<unsigned char>()};
+    size_t count{leaf_hashes.size()};
+    while (count > 1) {
+        const size_t parent_count{count / 2};
+        if (!LaunchTaggedHashRecords(
+                current, 64, parent_count, 0x01, next,
+                g_merkle_ws.stream)) {
+            return false;
+        }
+        std::swap(current, next);
+        count = parent_count;
+    }
+    if (cudaMemcpyAsync(
+            root.data(), current, 32, cudaMemcpyDeviceToHost,
+            g_merkle_ws.stream) != cudaSuccess ||
+        cudaStreamSynchronize(g_merkle_ws.stream) != cudaSuccess) {
+        root.SetNull();
+        return false;
+    }
+    return true;
 }
 
 bool LaunchRcExactReplayExpandMx(

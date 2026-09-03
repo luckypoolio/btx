@@ -158,6 +158,15 @@ RunRcExactReplaySlotReuseOrderingTest();
     const uint256& prf_s, const uint256& prf_z, uint32_t query_rows,
     uint32_t context_rows, uint32_t d_head, std::vector<int8_t>& out_z);
 
+/** CUDA SHA256d lanes for the RC tile tree. Payloads are copied in bounded
+ * batches; only 32-byte leaf hashes and the final root return to the host. */
+[[nodiscard]] bool LaunchRcExactReplayMerkleLeaves(
+    const unsigned char* leaf_payloads, uint32_t leaf_bytes,
+    size_t leaf_count, std::vector<uint256>& leaf_hashes);
+
+[[nodiscard]] bool LaunchRcExactReplayMerkleRoot(
+    const std::vector<uint256>& leaf_hashes, uint256& root);
+
 /** Direct CUDA implementation of the canonical ExpandMx operand stream.
  * The implementation deterministically extends rejection-sampling batches
  * until every requested mantissa exists; it never reports success for an

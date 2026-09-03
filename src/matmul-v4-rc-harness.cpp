@@ -1687,7 +1687,10 @@ int main(int argc, char* argv[])
             : acceleration_totals.device_xof_calls != 0
                 ? "Every consensus matrix contraction is device-enforced; the "
                   "seeded Profile-1 lane generated Q/K/V and FFN weights on "
-                  "device, while X0 and Merkle hashing remained on the host."
+                  "device, while X0 remained on the host" +
+                  std::string{acceleration_totals.device_merkle_rounds > 0
+                      ? "; Merkle hashing and root folding ran on device."
+                      : " and Merkle hashing remained on the host."}
             : "Every consensus matrix contraction is device-enforced; deterministic "
               "XOF, ExtractMX, Merkle hashing, and operand staging remain on the host.");
 
