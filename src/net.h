@@ -969,6 +969,17 @@ public:
     PollArchivePendingRecoveryMessage(bool allow_block_getdata)
         EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
 
+    /** Extract the earliest small, read-only header/body request after the
+     * handshake. Unrelated ingest remains queued, in order, for msghand.
+     * Only the opt-in retained-block worker calls this method. */
+    std::optional<CNetMessage> PollRetainedBlockServingRequest()
+        EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
+
+    /** Preserve an extracted request when the serving worker cannot acquire
+     * the chain lock. The payload must not have been consumed. */
+    void RequeueRetainedBlockServingRequest(CNetMessage&& msg)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
+
     /** True if the process queue still holds a message of this type
      *  (does not consume). Used to prefer archive GETDATA before miner
      *  BLOCK deserialize on a local signer. */

@@ -19,8 +19,10 @@ guard blocked block production with insufficient_peer_consensus.
 Serving headers or a requested retained body is a read: authority rules govern
 which BODIES a node TRUSTS, never who may ask it questions. The second
 regression keeps an archive GETDATA backlog pending while a plain peer asks for
-headers and one block, so the signer dispatcher cannot pass merely because the
-archive worker emptied an unrealistically small request first.
+headers and 280 historical blocks, so the signer dispatcher cannot pass merely
+because the archive worker emptied an unrealistically small request first.
+Valid ADDR and HEADERS ingestion messages precede these reads, reproducing the
+queue-front starvation that a handshake-only synthetic client does not expose.
 
 Asserts by received messages and getpeerinfo byte counters, never by
 debug.log strings (LogDebug lines are invisible without -debug=net).
@@ -35,10 +37,13 @@ from test_framework.messages import (
     MSG_BLOCK,
     MSG_WITNESS_FLAG,
     NODE_NETWORK,
+    NODE_NETWORK_LIMITED,
     NODE_WITNESS,
+    msg_addr,
     msg_getdata,
     msg_getaddr,
     msg_getheaders,
+    msg_headers,
     msg_sendcmpct,
     msg_sendheaders,
 )
@@ -47,7 +52,9 @@ from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_greater_than
 from test_framework.wallet_util import generate_keypair
 
-CHAIN_HEIGHT = 10
+CHAIN_HEIGHT = 570
+HISTORICAL_BODY_COUNT = 280
+BODY_REQUEST_WINDOW = 16
 NODE_MATMUL_ATTESTATION_ARCHIVE = 1 << 31
 ARCHIVE_BACKPRESSURE_BYTES = 64 * 1024 * 1024
 
@@ -80,6 +87,16 @@ class PauseableP2P(P2PInterface):
             raise errors[0]
 
 
+class BodyReader(P2PInterface):
+    def __init__(self):
+        super().__init__()
+        self.received_bodies = {}
+
+    def on_block(self, message):
+        message.block.calc_sha256()
+        self.received_bodies[message.block.hash] = message.block
+
+
 class AuthorityServesHeadersTest(BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 1
@@ -94,7 +111,12 @@ class AuthorityServesHeadersTest(BitcoinTestFramework):
             f"-matmulattestationsignerkey={signer_wif}",
             "-matmulattestationserve=1",
             "-serveretainedhistoricalblocks=1",
+            "-prune=550",
             "-maxsendbuffer=1",
+            # This is a dispatch/serving test, not a GPU proof-transition test.
+            "-regtestmatmulv4height=2147483647",
+            "-regtestrcheight=2147483647",
+            "-regtestrccoupledheight=2147483647",
         ]]
 
     @staticmethod
@@ -162,7 +184,7 @@ class AuthorityServesHeadersTest(BitcoinTestFramework):
         )
         archive_address = self.peer_address(archive)
         reader = node.add_p2p_connection(
-            P2PInterface(), services=NODE_NETWORK | NODE_WITNESS)
+            BodyReader(), services=NODE_NETWORK | NODE_WITNESS)
         reader_address = self.peer_address(reader)
 
         # One maximal GETDATA is small enough for the receive limit, while its
@@ -193,6 +215,11 @@ class AuthorityServesHeadersTest(BitcoinTestFramework):
         reader.send_message(msg_sendheaders())
         reader.send_message(msg_sendcmpct())
         reader.send_message(msg_getaddr())
+        # These valid ingestion messages are not public reads. They must not
+        # head-of-line block following read requests when archive work stalls
+        # normal message ingestion on a signer node.
+        reader.send_message(msg_addr())
+        reader.send_message(msg_headers())
         req = msg_getheaders()
         req.locator.vHave = [genesis]
         req.hashstop = 0
@@ -200,15 +227,38 @@ class AuthorityServesHeadersTest(BitcoinTestFramework):
         reader.wait_until(
             lambda: reader.last_message.get("headers") is not None
             and len(reader.last_message["headers"].headers) > 0,
-            timeout=30,
+            timeout=10,
         )
         assert_equal(reader.last_message["headers"].headers[-1].rehash(), tip)
 
-        body_getdata = msg_getdata()
-        body_getdata.inv = [CInv(MSG_BLOCK | MSG_WITNESS_FLAG, tip)]
-        reader.send_message(body_getdata)
-        reader.wait_for_block(tip, timeout=30)
-        reader.sync_with_ping(timeout=30)
+        # Every requested body is outside NODE_NETWORK_LIMITED's guaranteed
+        # window, but still physically retained. Separate singleton GETDATA
+        # messages mirror a peer issuing getblockfrompeer for a missing branch.
+        assert_greater_than(CHAIN_HEIGHT - HISTORICAL_BODY_COUNT, 288)
+        hashes = [node.getblockhash(height)
+                  for height in range(1, HISTORICAL_BODY_COUNT + 1)]
+        expected_bodies = {block_hash: node.getblock(block_hash, 0)
+                           for block_hash in hashes}
+        for offset in range(0, len(hashes), BODY_REQUEST_WINDOW):
+            batch = hashes[offset:offset + BODY_REQUEST_WINDOW]
+            reader.send_message(msg_addr())
+            reader.send_message(msg_headers())
+            for block_hash in batch:
+                reader.send_message(msg_getdata([
+                    CInv(MSG_BLOCK | MSG_WITNESS_FLAG, int(block_hash, 16)),
+                ]))
+            reader.wait_until(
+                lambda: all(block_hash in reader.received_bodies for block_hash in batch),
+                timeout=10,
+            )
+            assert self.peer_info(archive_address)["bytessent_per_msg"].get(
+                "block", 0) < expected_archive_block_bytes
+        assert_equal(len(reader.received_bodies), HISTORICAL_BODY_COUNT)
+        for block_hash in hashes:
+            body = reader.received_bodies[block_hash]
+            assert_greater_than(len(body.vtx), 0)
+            assert_equal(body.calc_merkle_root(), body.hashMerkleRoot)
+            assert_equal(body.serialize().hex(), expected_bodies[block_hash])
 
         reader_info = self.peer_info(reader_address)
         assert_greater_than(reader_info["bytesrecv_per_msg"].get("getheaders", 0), 0)
@@ -222,7 +272,8 @@ class AuthorityServesHeadersTest(BitcoinTestFramework):
         assert self.peer_info(archive_address)["bytessent_per_msg"].get(
             "block", 0) < expected_archive_block_bytes
         self.log.info(
-            "served headers and a block while %d archive block requests remained backpressured",
+            "served headers and all %d retained bodies (>288 deep) while %d archive block requests remained backpressured",
+            HISTORICAL_BODY_COUNT,
             request_count,
         )
         node.disconnect_p2ps()
@@ -231,6 +282,9 @@ class AuthorityServesHeadersTest(BitcoinTestFramework):
         node = self.nodes[0]
         self.generate(node, CHAIN_HEIGHT)
         assert_equal(node.getmatmultrustedstatus()["local_signer"], True)
+        services = int(node.getnetworkinfo()["localservices"], 16)
+        assert services & NODE_NETWORK_LIMITED
+        assert not services & NODE_NETWORK
 
         # An inbound peer with NO matmul service bits and NO permissions.
         self.assert_headers_served(

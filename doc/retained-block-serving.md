@@ -5,9 +5,14 @@ for active-chain bodies that are still on disk, including bodies more than
 288 blocks behind the tip. Missing bodies are not restored. The node continues
 to advertise `NODE_NETWORK_LIMITED`.
 
-On a local signer with pending archive requests, ordinary peers can process
-bounded post-handshake controls, `getheaders`, and one explicit block request
-per visit. This does not grant authority privileges or change block validation.
+On a local signer, an independent serving worker handles `getheaders` and
+singleton full/witness `getdata` requests after the handshake. These reads can
+pass unrelated queued ingest even while the main message handler validates
+blocks or prioritizes an archive. The worker serves at most one public request
+per peer and 16 requests per pass, retains requests while the chain lock is
+busy, and respects send-buffer and upload limits. It does not grant authority
+privileges or change block validation. Batched, transaction and compact-block
+requests remain on the normal message-processing path.
 
 Example serving-node settings:
 

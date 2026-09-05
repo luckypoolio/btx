@@ -4667,6 +4667,35 @@ CNode::PollArchivePendingRecoveryMessage(bool allow_block_getdata)
     return std::make_pair(std::move(msgs.front()), *classification);
 }
 
+std::optional<CNetMessage> CNode::PollRetainedBlockServingRequest()
+{
+    if (!fSuccessfullyConnected || fDisconnect || fPauseSend) return std::nullopt;
+    LOCK(m_msg_process_queue_mutex);
+    // The receive-flood limit bounds the queue. Scan without decoding any
+    // ingest payload; in particular never validate a block on this worker.
+    for (auto it = m_msg_process_queue.begin(); it != m_msg_process_queue.end(); ++it) {
+        if (it->m_type != NetMsgType::GETHEADERS && it->m_type != NetMsgType::GETDATA) continue;
+        const auto kind{ClassifyArchivePendingRecoveryMessage(
+            it->m_type, Span<const std::byte>{it->m_recv.data(), it->m_recv.size()},
+            /*allow_block_getdata=*/true)};
+        if (!kind) continue;
+        m_msg_process_queue_size -= it->GetMemoryUsage();
+        CNetMessage msg{std::move(*it)};
+        m_msg_process_queue.erase(it);
+        fPauseRecv = m_msg_process_queue_size > m_recv_flood_size;
+        return msg;
+    }
+    return std::nullopt;
+}
+
+void CNode::RequeueRetainedBlockServingRequest(CNetMessage&& msg)
+{
+    LOCK(m_msg_process_queue_mutex);
+    m_msg_process_queue_size += msg.GetMemoryUsage();
+    m_msg_process_queue.emplace_front(std::move(msg));
+    fPauseRecv = m_msg_process_queue_size > m_recv_flood_size;
+}
+
 std::optional<std::pair<CNetMessage, bool>> CNode::PollMessage()
 {
     LOCK(m_msg_process_queue_mutex);

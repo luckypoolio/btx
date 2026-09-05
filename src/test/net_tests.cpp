@@ -121,6 +121,48 @@ BOOST_AUTO_TEST_CASE(archive_pending_recovery_queue)
     BOOST_CHECK(!peer.PollArchivePendingRecoveryMessage(true));
 }
 
+BOOST_AUTO_TEST_CASE(retained_block_serving_queue)
+{
+    auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    CNode peer{0, nullptr, CAddress{}, 0, 0, CAddress{}, "retained-serving-test",
+               ConnectionType::INBOUND, false, 0};
+    const uint256 hash{uint256::ONE};
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(peer, NetMsg::Make(NetMsgType::HEADERS)));
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(peer, NetMsg::Make(
+        NetMsgType::GETDATA, std::vector<CInv>{{MSG_WITNESS_BLOCK, hash}})));
+    // The worker cannot bypass VERSION/VERACK negotiation.
+    BOOST_CHECK(!peer.PollRetainedBlockServingRequest());
+    peer.fSuccessfullyConnected = true;
+    peer.fPauseSend = true;
+    BOOST_CHECK(!peer.PollRetainedBlockServingRequest());
+    peer.fPauseSend = false;
+    auto body{peer.PollRetainedBlockServingRequest()};
+    BOOST_REQUIRE(body);
+    BOOST_CHECK_EQUAL(body->m_type, NetMsgType::GETDATA);
+    // A retry must retain the exact payload and not lose the request.
+    peer.RequeueRetainedBlockServingRequest(std::move(*body));
+    auto retry{peer.PollRetainedBlockServingRequest()};
+    BOOST_REQUIRE(retry);
+    std::vector<CInv> invs;
+    retry->m_recv >> invs;
+    BOOST_REQUIRE_EQUAL(invs.size(), 1U);
+    BOOST_CHECK(invs.front().hash == hash);
+    auto ingest{peer.PollMessage()};
+    BOOST_REQUIRE(ingest);
+    BOOST_CHECK_EQUAL(ingest->first.m_type, NetMsgType::HEADERS);
+    BOOST_CHECK(!peer.PollMessage());
+
+    for (const uint32_t type : {MSG_TX, MSG_FILTERED_BLOCK, MSG_CMPCT_BLOCK}) {
+        BOOST_REQUIRE(connman.ReceiveMsgFrom(peer, NetMsg::Make(
+            NetMsgType::GETDATA, std::vector<CInv>{{type, hash}})));
+        BOOST_CHECK(!peer.PollRetainedBlockServingRequest());
+        BOOST_REQUIRE(peer.PollMessage());
+    }
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(peer, NetMsg::Make(NetMsgType::GETDATA)));
+    BOOST_CHECK(!peer.PollRetainedBlockServingRequest());
+    BOOST_REQUIRE(peer.PollMessage());
+}
+
 BOOST_AUTO_TEST_CASE(cnode_listen_port)
 {
     // test default

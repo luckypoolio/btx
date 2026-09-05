@@ -2514,6 +2514,8 @@ private:
     /** Unlocked snapshot of IsSignedFrontierBodyCatchUp. True until the
      *  first cs_main computation so miner GETDATA is not served at start. */
     mutable std::atomic<bool> m_signed_frontier_catch_up{true};
+    /** Owned only by the archive serving worker, for public-read fairness. */
+    NodeId m_retained_serve_last_peer{-1};
 
     /** Determine whether or not a peer can request a transaction, and return it (or nullptr if not found or not allowed). */
     CTransactionRef FindTxForGetData(const Peer::TxRelay& tx_relay, const GenTxid& gtxid)
@@ -3016,6 +3018,13 @@ private:
                                             bool try_cs_main, bool hold_g_msgproc,
                                             bool active_chain_only = false)
         EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex);
+    GetBlockDataOutcome ServeRetainedHeadersRequest(
+        CNode& pfrom, const CBlockLocator& locator, const uint256& hash_stop)
+        LOCKS_EXCLUDED(cs_main, NetEventsInterface::g_msgproc_mutex);
+    bool ServeRetainedBlockRequests(std::atomic<bool>& interrupt)
+        LOCKS_EXCLUDED(cs_main, NetEventsInterface::g_msgproc_mutex);
+    bool ShouldReserveRetainedServingRequest(
+        const CNode& pfrom, const CNetMessage& message) const;
 
     /**
      * Validation logic for compact filters request handling.
@@ -9530,13 +9539,164 @@ void PeerManagerImpl::ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic
 }
 
 namespace {
+bool PeerManagerImpl::ShouldReserveRetainedServingRequest(
+    const CNode& pfrom, const CNetMessage& message) const
+{
+    if (!m_opts.serve_retained_historical_blocks ||
+        !m_connman.ArchiveBlockServeRunning() || !pfrom.fSuccessfullyConnected ||
+        (message.m_type != NetMsgType::GETHEADERS &&
+         message.m_type != NetMsgType::GETDATA)) {
+        return false;
+    }
+    return ClassifyArchivePendingRecoveryMessage(
+        message.m_type,
+        Span<const std::byte>{message.m_recv.data(), message.m_recv.size()},
+        /*allow_block_getdata=*/true).has_value();
+}
+
+PeerManagerImpl::GetBlockDataOutcome PeerManagerImpl::ServeRetainedHeadersRequest(
+    CNode& pfrom, const CBlockLocator& locator, const uint256& hash_stop)
+{
+    AssertLockNotHeld(cs_main);
+    AssertLockNotHeld(NetEventsInterface::g_msgproc_mutex);
+    if (locator.vHave.size() > MAX_LOCATOR_SZ) {
+        pfrom.fDisconnect = true;
+        return GetBlockDataOutcome::Done;
+    }
+    if (m_chainman.m_blockman.LoadingBlocks()) return GetBlockDataOutcome::Done;
+
+    // The independent read worker never waits behind validation while holding
+    // a peer queue lock. Keep the request queued for another pass instead.
+    TRY_LOCK(cs_main, lock);
+    if (!lock) return GetBlockDataOutcome::CsMainBusy;
+
+    const CBlockIndex* const tip{m_chainman.ActiveTip()};
+    const bool download{pfrom.HasPermission(NetPermissionFlags::Download)};
+    const bool tip_quorum{
+        tip != nullptr && node::matmul_trusted::HasQuorumInMemory(
+            tip->GetBlockHash(), tip->nHeight)};
+    const bool enough_work{
+        tip != nullptr &&
+        ((tip_quorum || !node::matmul_trusted::IsTrustedMirror())
+             ? tip->nChainWork >= m_chainman.MinimumChainWork()
+             : tip->nAuthenticatedChainWork >= m_chainman.MinimumChainWork())};
+    if (tip == nullptr || !node::matmul_trusted::MayServeGetHeaders(
+                              download, tip_quorum, enough_work)) {
+        MakeAndPushMessage(pfrom, NetMsgType::HEADERS, std::vector<CBlockHeader>());
+        return GetBlockDataOutcome::Done;
+    }
+
+    const CBlockIndex* pindex{nullptr};
+    if (locator.IsNull()) {
+        pindex = m_chainman.m_blockman.LookupBlockIndex(hash_stop);
+        if (!pindex || !BlockRequestAllowed(pindex)) return GetBlockDataOutcome::Done;
+    } else {
+        pindex = m_chainman.ActiveChainstate().FindForkInGlobalIndex(locator);
+        if (pindex) pindex = m_chainman.ActiveChain().Next(pindex);
+    }
+
+    // Match the normal GETHEADERS work gate, response limit and wire format.
+    // This path only serves existing headers; it never admits peer chain data.
+    std::vector<CBlock> headers;
+    int remaining{m_opts.max_headers_result};
+    for (; pindex; pindex = m_chainman.ActiveChain().Next(pindex)) {
+        headers.emplace_back(pindex->GetBlockHeader());
+        if (--remaining <= 0 || pindex->GetBlockHash() == hash_stop) break;
+    }
+    if (CNodeState* state{State(pfrom.GetId())}) {
+        state->pindexBestHeaderSent = pindex ? pindex : tip;
+    }
+    MakeAndPushMessage(pfrom, NetMsgType::HEADERS, TX_WITH_WITNESS(headers));
+    return GetBlockDataOutcome::Done;
+}
+
+bool PeerManagerImpl::ServeRetainedBlockRequests(std::atomic<bool>& interrupt)
+{
+    AssertLockNotHeld(cs_main);
+    AssertLockNotHeld(NetEventsInterface::g_msgproc_mutex);
+    if (!m_opts.serve_retained_historical_blocks) return false;
+
+    std::vector<NodeId> ids;
+    m_connman.ForEachNode([&](CNode* pnode) {
+        if (pnode && pnode->fSuccessfullyConnected && !pnode->fDisconnect &&
+            !pnode->fPauseSend) {
+            ids.push_back(pnode->GetId());
+        }
+    });
+    std::sort(ids.begin(), ids.end());
+    std::rotate(ids.begin(),
+                std::upper_bound(ids.begin(), ids.end(), m_retained_serve_last_peer),
+                ids.end());
+
+    bool cs_main_busy{false};
+    unsigned int serviced{0};
+    static constexpr unsigned int MAX_PUBLIC_READS_PER_PASS{16};
+    for (const NodeId id : ids) {
+        if (interrupt || m_stopping.load(std::memory_order_acquire)) break;
+        m_retained_serve_last_peer = id;
+        const std::shared_ptr<CNode> pnode{m_connman.GetNodeRef(id)};
+        if (!pnode || !pnode->fSuccessfullyConnected || pnode->fDisconnect ||
+            pnode->fPauseSend) continue;
+        PeerRef peer{GetPeerRef(id)};
+        if (!peer) continue;
+
+        auto request{pnode->PollRetainedBlockServingRequest()};
+        if (!request) continue;
+        ++serviced;
+        try {
+            // Parse a copy: a failed cs_main try-lock must requeue the exact
+            // original wire request, not a consumed deserialization stream.
+            DataStream payload{Span<const std::byte>{
+                request->m_recv.data(), request->m_recv.size()}};
+            GetBlockDataOutcome outcome{GetBlockDataOutcome::Done};
+            if (request->m_type == NetMsgType::GETHEADERS) {
+                CBlockLocator locator;
+                uint256 hash_stop;
+                payload >> locator >> hash_stop;
+                if (!payload.empty()) throw std::ios_base::failure("trailing getheaders data");
+                outcome = ServeRetainedHeadersRequest(*pnode, locator, hash_stop);
+            } else {
+                // The queue extractor admits only canonical singleton plain
+                // or witness GETDATA, never transaction/compact/filter batches.
+                std::vector<CInv> invs;
+                payload >> invs;
+                if (invs.size() != 1 || !payload.empty() ||
+                    (!invs.front().IsMsgBlk() && !invs.front().IsMsgWitnessBlk())) {
+                    throw std::ios_base::failure("invalid retained block request");
+                }
+                outcome = ProcessGetBlockData(*pnode, *peer, invs.front(),
+                    /*try_cs_main=*/true, /*hold_g_msgproc=*/false,
+                    /*active_chain_only=*/true);
+            }
+            if (outcome == GetBlockDataOutcome::CsMainBusy) {
+                cs_main_busy = true;
+                pnode->RequeueRetainedBlockServingRequest(std::move(*request));
+            } else if (m_opts.capture_messages) {
+                CaptureMessage(pnode->addr, request->m_type,
+                               MakeUCharSpan(request->m_recv), /*is_incoming=*/true);
+            }
+        } catch (const std::exception& e) {
+            // Misbehavior handling has additional message-thread state. A
+            // malformed public read can simply disconnect without touching it.
+            LogDebug(BCLog::NET, "retained block serving request: %s peer=%d\n",
+                     e.what(), id);
+            pnode->fDisconnect = true;
+        }
+        if (serviced >= MAX_PUBLIC_READS_PER_PASS) break;
+    }
+    return cs_main_busy;
+}
+
 bool PeerManagerImpl::ServeArchiveBlockGetData(std::atomic<bool>& interrupt)
 {
     AssertLockNotHeld(cs_main);
     if (m_chainman.IsDiscoveryRelay()) return false;
     if (m_stopping.load(std::memory_order_acquire)) return false;
 
-    bool cs_main_busy{false};
+    // Public reads have an independent bounded turn before archive backlog.
+    // Neither this path nor its queue extraction needs g_msgproc_mutex, so
+    // a busy validator or unrelated inbound message cannot mute block serving.
+    bool cs_main_busy{ServeRetainedBlockRequests(interrupt)};
     std::vector<NodeId> ids;
     m_connman.ForEachNode([&](CNode* pnode) {
         if (pnode == nullptr) return;
@@ -9552,7 +9712,8 @@ bool PeerManagerImpl::ServeArchiveBlockGetData(std::atomic<bool>& interrupt)
         PeerRef peer{GetPeerRef(pnode->GetId())};
         if (!peer) continue;
 
-        LOCK(peer->m_getdata_requests_mutex);
+        TRY_LOCK(peer->m_getdata_requests_mutex, queue_lock);
+        if (!queue_lock) continue;
         if (peer->m_getdata_requests.empty()) {
             pnode->m_has_getdata_requests.store(false);
             continue;
@@ -9562,6 +9723,8 @@ bool PeerManagerImpl::ServeArchiveBlockGetData(std::atomic<bool>& interrupt)
             ++it;
         }
         const auto first_block{it};
+        unsigned int served{0};
+        static constexpr unsigned int MAX_ARCHIVE_BLOCKS_PER_PEER_PASS{16};
         while (it != peer->m_getdata_requests.end() && !pnode->fPauseSend &&
                it->IsGenBlkMsg()) {
             if (interrupt) break;
@@ -9573,6 +9736,7 @@ bool PeerManagerImpl::ServeArchiveBlockGetData(std::atomic<bool>& interrupt)
                 break;
             }
             ++it;
+            if (++served >= MAX_ARCHIVE_BLOCKS_PER_PEER_PASS) break;
         }
         peer->m_getdata_requests.erase(first_block, it);
         pnode->m_has_getdata_requests.store(!peer->m_getdata_requests.empty());
@@ -20537,6 +20701,12 @@ bool PeerManagerImpl::ProcessArchivePendingRecoveryMessage(
         m_opts.serve_retained_historical_blocks)};
     if (!result) return false;
     CNetMessage& msg{result->first};
+    if (ShouldReserveRetainedServingRequest(*pfrom, msg)) {
+        // The global message handler must not steal a read and then block
+        // on validation while the independent serving worker has no request.
+        pfrom->RequeueRetainedBlockServingRequest(std::move(msg));
+        return false;
+    }
     if (m_opts.capture_messages) {
         CaptureMessage(pfrom->addr, msg.m_type, MakeUCharSpan(msg.m_recv),
                        /*is_incoming=*/true);
@@ -20648,6 +20818,10 @@ bool PeerManagerImpl::ProcessMessages(CNode* pfrom, std::atomic<bool>& interrupt
     }
 
     CNetMessage& msg{poll_result->first};
+    if (ShouldReserveRetainedServingRequest(*pfrom, msg)) {
+        pfrom->RequeueRetainedBlockServingRequest(std::move(msg));
+        return false;
+    }
     bool fMoreWork = poll_result->second;
 
     TRACEPOINT(net, inbound_message,
