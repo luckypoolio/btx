@@ -24,13 +24,18 @@ The size of some in-memory caches can be reduced. As caches trade off memory usa
 
 ## Number of peers
 
-- `-maxconnections=<n>` - the maximum number of connections, which defaults to 125. Each active connection takes up some
-  memory. This option applies only if inbound connections are enabled; otherwise, the number of connections will not
-  be more than 11. Of the 11 outbound peers, there can be 8 full-relay connections, 2 block-relay-only ones,
-  and occasionally 1 short-lived feeler or extra outbound block-relay-only connection.
+- `-maxconnections=<n>` limits automatic and inbound connections and defaults to 125. Each active connection consumes
+  memory. The steady automatic outbound targets default to 8 full-relay peers (`-maxoutboundfullrelay`) and 2
+  block-relay-only peers (`-maxoutboundblockrelay`). When `-maxconnections` leaves room, one additional automatic slot
+  is reserved for short-lived feeler, stale-tip, network-diversity, or partition-detection probes. Raising either
+  steady target at a fixed `-maxconnections` value reduces inbound capacity.
 
-- These limits do not apply to connections added manually with the `-addnode` configuration option or
-  the `addnode` RPC, which have a separate limit of 8 connections.
+- Setting either outbound target to zero disables steady peers of that class, but safety probes may still open one
+  temporary peer when capacity permits. Set `-maxconnections=0` to disable all automatic connections.
+
+- Persistent peers configured with `-addnode` or RPC `addnode ... add` use `-maxaddnodeconnections` (default 8) and do
+  not count against `-maxconnections`. Explicit `-connect` peers and one-shot RPC `addnode ... onetry` connections do
+  not count against either limit.
 
 ## Thread configuration
 

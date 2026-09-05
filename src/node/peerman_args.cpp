@@ -28,6 +28,7 @@ void ApplyArgsManOptions(const ArgsManager& argsman, PeerManager::Options& optio
     if (auto value{argsman.GetBoolArg("-capturemessages")}) options.capture_messages = *value;
 
     if (auto value{argsman.GetBoolArg("-blocksonly")}) options.ignore_incoming_txs = *value;
+    if (auto value{argsman.GetBoolArg("-serveretainedhistoricalblocks")}) options.serve_retained_historical_blocks = *value;
 
     if (auto value{argsman.GetIntArg("-minsmilev2version")}) {
         options.min_smile_v2_version = int(std::clamp<int64_t>(*value, 0, std::numeric_limits<int>::max()));

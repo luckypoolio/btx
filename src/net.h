@@ -34,6 +34,7 @@
 #include <util/threadinterrupt.h>
 #include <util/time.h>
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -119,6 +120,56 @@ static const int MAX_FEELER_CONNECTIONS = 1;
 static const bool DEFAULT_LISTEN = true;
 /** The maximum number of peer connections to maintain. */
 static const unsigned int DEFAULT_MAX_PEER_CONNECTIONS = 125;
+
+struct ConnectionLimits {
+    int max_outbound_full_relay;
+    int max_outbound_block_relay;
+    int max_feeler;
+    int max_automatic_outbound;
+    int max_inbound;
+    int max_addnode;
+};
+
+/** A message that may make bounded progress while a local signer prioritizes
+ * archive GETDATA. Only lightweight post-handshake control messages and an
+ * explicitly enabled singleton plain/witness block request qualify. */
+enum class ArchivePendingRecoveryMessage {
+    CONTROL,
+    BLOCK_GETDATA,
+};
+
+/** Classify an already-framed queue-front message for the archive-pending
+ * recovery path. Payload limits are intentionally stricter than the global P2P
+ * message limit so this path cannot be used to smuggle expensive work past the
+ * local-signer archive priority gate. */
+[[nodiscard]] std::optional<ArchivePendingRecoveryMessage>
+ClassifyArchivePendingRecoveryMessage(std::string_view msg_type,
+                                      Span<const std::byte> payload,
+                                      bool allow_block_getdata);
+
+/** Derive effective peer-class limits after -maxconnections constrains the
+ * configured steady outbound targets. Inputs are validated as nonnegative by
+ * init; clamping here keeps programmatic CConnman users safe as well. */
+[[nodiscard]] constexpr ConnectionLimits CalculateConnectionLimits(
+    int max_automatic_connections,
+    int configured_max_outbound_full_relay,
+    int configured_max_outbound_block_relay,
+    int configured_max_addnode)
+{
+    const int total{std::max(0, max_automatic_connections)};
+    const int full{std::min(std::max(0, configured_max_outbound_full_relay), total)};
+    const int block{std::min(std::max(0, configured_max_outbound_block_relay), total - full)};
+    const int feeler{std::min(MAX_FEELER_CONNECTIONS, total - full - block)};
+    const int automatic_outbound{full + block + feeler};
+    return {
+        .max_outbound_full_relay = full,
+        .max_outbound_block_relay = block,
+        .max_feeler = feeler,
+        .max_automatic_outbound = automatic_outbound,
+        .max_inbound = total - automatic_outbound,
+        .max_addnode = std::max(0, configured_max_addnode),
+    };
+}
 /** The default for -maxuploadtarget. 0 = Unlimited */
 static const std::string DEFAULT_MAX_UPLOAD_TARGET{"0M"};
 /** Default for blocks only*/
@@ -911,6 +962,13 @@ public:
     std::optional<std::pair<CNetMessage, bool>> PollMessage()
         EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
 
+    /** Poll the queue front only when it is safe for the bounded
+     * archive-pending recovery path. A disallowed front message is left in
+     * place; a later allowed message can never bypass it. */
+    std::optional<std::pair<CNetMessage, ArchivePendingRecoveryMessage>>
+    PollArchivePendingRecoveryMessage(bool allow_block_getdata)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
+
     /** True if the process queue still holds a message of this type
      *  (does not consume). Used to prefer archive GETDATA before miner
      *  BLOCK deserialize on a local signer. */
@@ -1229,6 +1287,18 @@ public:
     */
     virtual bool ProcessMessages(CNode* pnode, std::atomic<bool>& interrupt) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex) = 0;
 
+    /** Process at most one queue-front message through the restricted recovery
+     * path used while a local signer prioritizes archive GETDATA. Returns true
+     * only when one message was consumed. This deliberately does not report
+     * more queued work, preventing an attacker from making msghand busy-spin. */
+    virtual bool ProcessArchivePendingRecoveryMessage(CNode* pnode, std::atomic<bool>& interrupt)
+        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex)
+    {
+        (void)pnode;
+        (void)interrupt;
+        return false;
+    }
+
     /**
     * Send queued protocol messages to a given node.
     *
@@ -1266,6 +1336,9 @@ public:
     {
         ServiceFlags m_local_services = NODE_NONE;
         int m_max_automatic_connections = 0;
+        int m_max_outbound_full_relay = MAX_OUTBOUND_FULL_RELAY_CONNECTIONS;
+        int m_max_outbound_block_relay = MAX_BLOCK_RELAY_ONLY_CONNECTIONS;
+        int m_max_addnode = MAX_ADDNODE_CONNECTIONS;
         CClientUIInterface* uiInterface = nullptr;
         NetEventsInterface* m_msgproc = nullptr;
         BanMan* m_banman = nullptr;
@@ -1297,11 +1370,19 @@ public:
         AssertLockNotHeld(m_total_bytes_sent_mutex);
 
         m_local_services = connOptions.m_local_services;
-        m_max_automatic_connections = connOptions.m_max_automatic_connections;
-        m_max_outbound_full_relay = std::min(MAX_OUTBOUND_FULL_RELAY_CONNECTIONS, m_max_automatic_connections);
-        m_max_outbound_block_relay = std::min(MAX_BLOCK_RELAY_ONLY_CONNECTIONS, m_max_automatic_connections - m_max_outbound_full_relay);
-        m_max_automatic_outbound = m_max_outbound_full_relay + m_max_outbound_block_relay + m_max_feeler;
-        m_max_inbound = std::max(0, m_max_automatic_connections - m_max_automatic_outbound);
+        m_max_automatic_connections = std::max(0, connOptions.m_max_automatic_connections);
+        m_configured_max_outbound_full_relay = std::max(0, connOptions.m_max_outbound_full_relay);
+        const auto limits{CalculateConnectionLimits(
+            m_max_automatic_connections,
+            connOptions.m_max_outbound_full_relay,
+            connOptions.m_max_outbound_block_relay,
+            connOptions.m_max_addnode)};
+        m_max_outbound_full_relay = limits.max_outbound_full_relay;
+        m_max_outbound_block_relay = limits.max_outbound_block_relay;
+        m_max_feeler = limits.max_feeler;
+        m_max_automatic_outbound = limits.max_automatic_outbound;
+        m_max_inbound = limits.max_inbound;
+        m_max_addnode = limits.max_addnode;
         m_use_addrman_outgoing = connOptions.m_use_addrman_outgoing;
         m_client_interface = connOptions.uiInterface;
         m_banman = connOptions.m_banman;
@@ -1787,6 +1868,9 @@ private:
 
     // How many full-relay (tx, block, addr) outbound peers we want
     int m_max_outbound_full_relay;
+
+    // Requested full-relay target before -maxconnections constrains it.
+    int m_configured_max_outbound_full_relay{MAX_OUTBOUND_FULL_RELAY_CONNECTIONS};
 
     // How many block-relay only outbound peers we want
     // We do not relay tx or addr messages with these peers

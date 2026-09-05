@@ -1429,6 +1429,8 @@ public:
     bool HasAllDesirableServiceFlags(ServiceFlags services) const override;
     bool ProcessMessages(CNode* pfrom, std::atomic<bool>& interrupt) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex);
+    bool ProcessArchivePendingRecoveryMessage(CNode* pfrom, std::atomic<bool>& interrupt) override
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex);
     bool SendMessages(CNode* pto) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, g_msgproc_mutex, !m_tx_download_mutex);
     bool ServeArchiveBlockGetData(std::atomic<bool>& interrupt) override
@@ -3011,7 +3013,8 @@ private:
         CsMainBusy,
     };
     GetBlockDataOutcome ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& inv,
-                                            bool try_cs_main, bool hold_g_msgproc)
+                                            bool try_cs_main, bool hold_g_msgproc,
+                                            bool active_chain_only = false)
         EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex);
 
     /**
@@ -9049,7 +9052,8 @@ std::optional<uint256> PeerManagerImpl::ExpireInboundBlockChunks(
 }
 
 PeerManagerImpl::GetBlockDataOutcome PeerManagerImpl::ProcessGetBlockData(
-    CNode& pfrom, Peer& peer, const CInv& inv, bool try_cs_main, bool hold_g_msgproc)
+    CNode& pfrom, Peer& peer, const CInv& inv, bool try_cs_main, bool hold_g_msgproc,
+    bool active_chain_only)
 {
     if (m_chainman.IsDiscoveryRelay()) {
         return GetBlockDataOutcome::Done;
@@ -9086,7 +9090,8 @@ PeerManagerImpl::GetBlockDataOutcome PeerManagerImpl::ProcessGetBlockData(
     // while b-mmverify held cs_main). Serve HAVE_DATA or NOTFOUND.
     // The archive worker never ActivateBestChain (ExactReplay belongs on
     // validation / msghand, not the GETDATA serve thread).
-    if (need_activate_chain && !node::matmul_trusted::HasLocalSigner() && hold_g_msgproc) {
+    if (need_activate_chain && !active_chain_only &&
+        !node::matmul_trusted::HasLocalSigner() && hold_g_msgproc) {
         BlockValidationState state;
         if (!m_chainman.ActiveChainstate().ActivateBestChain(state, a_recent_block)) {
             LogDebug(BCLog::NET, "failed to activate chain (%s)\n", state.ToString());
@@ -9109,6 +9114,12 @@ PeerManagerImpl::GetBlockDataOutcome PeerManagerImpl::ProcessGetBlockData(
             send_block_notfound();
             return GetBlockDataOutcome::Done;
         }
+        if (active_chain_only &&
+            (!m_chainman.ActiveChain().Contains(pindex) ||
+             !(pindex->nStatus & BLOCK_HAVE_DATA))) {
+            send_block_notfound();
+            return GetBlockDataOutcome::Done;
+        }
         if (!BlockRequestAllowed(pindex)) {
             LogDebug(BCLog::NET, "%s: ignoring request from peer=%i for old block that isn't in the main chain\n", __func__, pfrom.GetId());
             send_block_notfound();
@@ -9125,10 +9136,24 @@ PeerManagerImpl::GetBlockDataOutcome PeerManagerImpl::ProcessGetBlockData(
             return GetBlockDataOutcome::Done;
         }
         tip = m_chainman.ActiveChain().Tip();
-        // Avoid leaking prune-height by never sending blocks below the NODE_NETWORK_LIMITED threshold
-        if (!pfrom.HasPermission(NetPermissionFlags::NoBan) && (
-                (((peer.m_our_services & NODE_NETWORK_LIMITED) == NODE_NETWORK_LIMITED) && ((peer.m_our_services & NODE_NETWORK) != NODE_NETWORK) && (tip->nHeight - pindex->nHeight > (int)NODE_NETWORK_LIMITED_MIN_BLOCKS + 2 /* add two blocks buffer extension for possible races */) )
-           )) {
+        // By default avoid leaking prune height by never sending blocks below
+        // the NODE_NETWORK_LIMITED threshold. Public recovery nodes may opt in
+        // to serving any requested active-chain body they still retain. The
+        // BLOCK_HAVE_DATA check below remains authoritative, and this does not
+        // advertise NODE_NETWORK or imply that pruned history was restored.
+        const bool below_limited_threshold{
+            ((peer.m_our_services & NODE_NETWORK_LIMITED) == NODE_NETWORK_LIMITED) &&
+            ((peer.m_our_services & NODE_NETWORK) != NODE_NETWORK) &&
+            (tip->nHeight - pindex->nHeight >
+             static_cast<int>(NODE_NETWORK_LIMITED_MIN_BLOCKS) + 2)};
+        const bool serve_retained_historical_block{
+            m_opts.serve_retained_historical_blocks &&
+            m_chainman.ActiveChain().Contains(pindex) &&
+            (pindex->nStatus & BLOCK_HAVE_DATA) &&
+            (inv.IsMsgBlk() || inv.IsMsgWitnessBlk())};
+        if (!pfrom.HasPermission(NetPermissionFlags::NoBan) &&
+            below_limited_threshold &&
+            !serve_retained_historical_block) {
             LogDebug(BCLog::NET, "Ignore block request below NODE_NETWORK_LIMITED threshold, %s\n", pfrom.DisconnectMsg(fLogIPs));
             //disconnect node and prevent it from stalling (would otherwise wait for the missing block)
             send_block_notfound();
@@ -20493,6 +20518,56 @@ void PeerManagerImpl::BanHammeringPeer(CNode& pnode, Peer& peer, std::string_vie
     }
     if (m_banman) m_banman->Ban(pnode.addr);
     m_connman.DisconnectNode(pnode.addr);
+}
+
+bool PeerManagerImpl::ProcessArchivePendingRecoveryMessage(
+    CNode* pfrom, std::atomic<bool>& interruptMsgProc)
+{
+    AssertLockHeld(g_msgproc_mutex);
+    AssertLockNotHeld(m_tx_download_mutex);
+    if (interruptMsgProc || pfrom->fDisconnect || pfrom->fPauseSend ||
+        !pfrom->fSuccessfullyConnected) return false;
+    PeerRef peer{GetPeerRef(pfrom->GetId())};
+    if (!peer) return false;
+    if (peer->m_node_state_pending.load(std::memory_order_acquire)) {
+        LOCK(cs_main);
+        EnsureNodeState(*peer);
+    }
+    auto result{pfrom->PollArchivePendingRecoveryMessage(
+        m_opts.serve_retained_historical_blocks)};
+    if (!result) return false;
+    CNetMessage& msg{result->first};
+    if (m_opts.capture_messages) {
+        CaptureMessage(pfrom->addr, msg.m_type, MakeUCharSpan(msg.m_recv),
+                       /*is_incoming=*/true);
+    }
+    try {
+        if (result->second == ArchivePendingRecoveryMessage::BLOCK_GETDATA) {
+            // The queue-front classifier already checked the exact singleton
+            // wire shape and plain/witness block type. Serve this one retained
+            // active-chain body without draining generic GETDATA or orphan
+            // queues and without granting this peer an authority role.
+            std::vector<CInv> invs;
+            msg.m_recv >> invs;
+            Assume(invs.size() == 1 && msg.m_recv.empty());
+            (void)ProcessGetBlockData(*pfrom, *peer, invs.front(),
+                                     /*try_cs_main=*/false,
+                                     /*hold_g_msgproc=*/true,
+                                     /*active_chain_only=*/true);
+        } else {
+            ProcessMessage(*pfrom, msg.m_type, msg.m_recv, msg.m_time,
+                           interruptMsgProc);
+        }
+    } catch (const std::ios_base::failure& e) {
+        Misbehaving(*peer, strprintf("deserialization error while parsing %s: %s",
+                                     SanitizeString(msg.m_type), e.what()));
+    } catch (const std::exception& e) {
+        LogDebug(BCLog::NET, "restricted recovery %s: %s peer=%d\n",
+                 SanitizeString(msg.m_type), e.what(), pfrom->GetId());
+    }
+    // True counts one consumed message against the per-loop signer cap. It
+    // does not request another immediate msghand pass.
+    return true;
 }
 
 bool PeerManagerImpl::ProcessMessages(CNode* pfrom, std::atomic<bool>& interruptMsgProc)

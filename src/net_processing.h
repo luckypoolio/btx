@@ -268,6 +268,9 @@ public:
     struct Options {
         //! Whether this node is running in -blocksonly mode
         bool ignore_incoming_txs{DEFAULT_BLOCKSONLY};
+        //! Whether a pruned node may serve requested historical active-chain
+        //! bodies beyond the NODE_NETWORK_LIMITED window when still retained.
+        bool serve_retained_historical_blocks{false};
         //! Whether transaction reconciliation protocol is enabled
         bool reconcile_txs{DEFAULT_TXRECONCILIATION_ENABLE};
         //! Maximum number of orphan transactions kept in memory

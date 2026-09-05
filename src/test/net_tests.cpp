@@ -46,6 +46,81 @@ using util::ToString;
 
 BOOST_FIXTURE_TEST_SUITE(net_tests, RegTestingSetup)
 
+BOOST_AUTO_TEST_CASE(connection_limits)
+{
+    const auto defaults{CalculateConnectionLimits(
+        DEFAULT_MAX_PEER_CONNECTIONS,
+        MAX_OUTBOUND_FULL_RELAY_CONNECTIONS,
+        MAX_BLOCK_RELAY_ONLY_CONNECTIONS,
+        MAX_ADDNODE_CONNECTIONS)};
+    BOOST_CHECK_EQUAL(defaults.max_outbound_full_relay, 8);
+    BOOST_CHECK_EQUAL(defaults.max_outbound_block_relay, 2);
+    BOOST_CHECK_EQUAL(defaults.max_feeler, 1);
+    BOOST_CHECK_EQUAL(defaults.max_automatic_outbound, 11);
+    BOOST_CHECK_EQUAL(defaults.max_inbound, 114);
+    BOOST_CHECK_EQUAL(defaults.max_addnode, 8);
+
+    const auto custom{CalculateConnectionLimits(125, 12, 4, 12)};
+    BOOST_CHECK_EQUAL(custom.max_outbound_full_relay, 12);
+    BOOST_CHECK_EQUAL(custom.max_outbound_block_relay, 4);
+    BOOST_CHECK_EQUAL(custom.max_feeler, 1);
+    BOOST_CHECK_EQUAL(custom.max_automatic_outbound, 17);
+    BOOST_CHECK_EQUAL(custom.max_inbound, 108);
+    BOOST_CHECK_EQUAL(custom.max_addnode, 12);
+
+    const auto constrained{CalculateConnectionLimits(10, 12, 4, 12)};
+    BOOST_CHECK_EQUAL(constrained.max_outbound_full_relay, 10);
+    BOOST_CHECK_EQUAL(constrained.max_outbound_block_relay, 0);
+    BOOST_CHECK_EQUAL(constrained.max_feeler, 0);
+    BOOST_CHECK_EQUAL(constrained.max_automatic_outbound, 10);
+    BOOST_CHECK_EQUAL(constrained.max_inbound, 0);
+
+    const auto zero{CalculateConnectionLimits(0, 12, 4, 0)};
+    BOOST_CHECK_EQUAL(zero.max_automatic_outbound, 0);
+    BOOST_CHECK_EQUAL(zero.max_inbound, 0);
+    BOOST_CHECK_EQUAL(zero.max_addnode, 0);
+}
+
+BOOST_AUTO_TEST_CASE(archive_pending_recovery_queue)
+{
+    auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    CNode peer{0, nullptr, CAddress{}, 0, 0, CAddress{}, "recovery-test",
+               ConnectionType::INBOUND, false, 0};
+    // A safe message later in the queue must not let a body-ingest message
+    // at its front through the restricted path.
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(peer, NetMsg::Make(NetMsgType::BLOCK)));
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(peer, NetMsg::Make(NetMsgType::PING, uint64_t{7})));
+    BOOST_CHECK(!peer.PollArchivePendingRecoveryMessage(true));
+    auto blocked{peer.PollMessage()};
+    BOOST_REQUIRE(blocked);
+    BOOST_CHECK_EQUAL(blocked->first.m_type, NetMsgType::BLOCK);
+    auto ping{peer.PollArchivePendingRecoveryMessage(false)};
+    BOOST_REQUIRE(ping);
+    BOOST_CHECK(ping->second == ArchivePendingRecoveryMessage::CONTROL);
+
+    const uint256 hash{uint256::ONE};
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(peer, NetMsg::Make(
+        NetMsgType::GETDATA, std::vector<CInv>{{MSG_WITNESS_BLOCK, hash}})));
+    BOOST_CHECK(!peer.PollArchivePendingRecoveryMessage(false));
+    auto body{peer.PollArchivePendingRecoveryMessage(true)};
+    BOOST_REQUIRE(body);
+    BOOST_CHECK(body->second == ArchivePendingRecoveryMessage::BLOCK_GETDATA);
+    BOOST_CHECK(!peer.PollMessage());
+
+    for (const uint32_t type : {MSG_TX, MSG_FILTERED_BLOCK, MSG_CMPCT_BLOCK}) {
+        BOOST_REQUIRE(connman.ReceiveMsgFrom(peer, NetMsg::Make(
+            NetMsgType::GETDATA, std::vector<CInv>{{type, hash}})));
+        BOOST_CHECK(!peer.PollArchivePendingRecoveryMessage(true));
+        BOOST_REQUIRE(peer.PollMessage());
+    }
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(peer, NetMsg::Make(
+        NetMsgType::GETDATA, std::vector<CInv>{{MSG_BLOCK, hash}, {MSG_BLOCK, hash}})));
+    BOOST_CHECK(!peer.PollArchivePendingRecoveryMessage(true));
+    BOOST_REQUIRE(peer.PollMessage());
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(peer, NetMsg::Make(NetMsgType::GETDATA)));
+    BOOST_CHECK(!peer.PollArchivePendingRecoveryMessage(true));
+}
+
 BOOST_AUTO_TEST_CASE(cnode_listen_port)
 {
     // test default

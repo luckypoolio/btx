@@ -216,6 +216,7 @@ BASE_SCRIPTS = [
     'p2p_matmul_compact_admission.py',
     'p2p_matmul_admission_precheck.py',
     'p2p_authority_serves_headers.py',
+    'p2p_retained_block_serving.py',
     'rpc_packages.py',
     'rpc_bind.py --ipv4',
     'rpc_bind.py --ipv6',

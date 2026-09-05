@@ -392,8 +392,8 @@ static RPCHelpMan addnode()
                 "\nAttempts to add or remove a node from the addnode list.\n"
                 "Or try a connection to a node once.\n"
                 +
-                strprintf("Addnode connections are limited to %u at a time", MAX_ADDNODE_CONNECTIONS) +
-                " and are counted separately from the -maxconnections limit.\n",
+                strprintf("Persistent connections created by \"add\" default to %d at a time and are configurable with -maxaddnodeconnections", MAX_ADDNODE_CONNECTIONS) +
+                "; they are counted separately from -maxconnections. \"onetry\" connections do not count against either limit.\n",
                 {
                     {"node", RPCArg::Type::STR, RPCArg::Optional::NO, "The address of the peer to connect to"},
                     {"command", RPCArg::Type::STR, RPCArg::Optional::NO, "'add' to add a node to the list, 'remove' to remove a node from the list, 'onetry' to try a connection to the node once"},

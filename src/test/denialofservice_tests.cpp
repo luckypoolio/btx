@@ -137,9 +137,11 @@ BOOST_FIXTURE_TEST_CASE(stale_tip_peer_management, OutboundTest)
     auto connman = std::make_unique<ConnmanTestMsg>(0x1337, 0x1337, *m_node.addrman, *m_node.netgroupman, Params());
     auto peerLogic = PeerManager::make(*connman, *m_node.addrman, nullptr, *m_node.chainman, *m_node.mempool, *m_node.warnings, {});
 
-    constexpr int max_outbound_full_relay = MAX_OUTBOUND_FULL_RELAY_CONNECTIONS;
+    // Use a non-default target to verify eviction follows the configured value.
+    constexpr int max_outbound_full_relay{3};
     CConnman::Options options;
     options.m_max_automatic_connections = DEFAULT_MAX_PEER_CONNECTIONS;
+    options.m_max_outbound_full_relay = max_outbound_full_relay;
 
     const auto time_init{GetTime<std::chrono::seconds>()};
     SetMockTime(time_init);
@@ -151,6 +153,7 @@ BOOST_FIXTURE_TEST_CASE(stale_tip_peer_management, OutboundTest)
     for (int i = 0; i < max_outbound_full_relay; ++i) {
         AddRandomOutboundPeer(id, vNodes, *peerLogic, *connman, ConnectionType::OUTBOUND_FULL_RELAY);
     }
+    BOOST_CHECK_EQUAL(connman->GetExtraFullOutboundCount(), 0);
 
     peerLogic->CheckForStaleTipAndEvictPeers();
 
@@ -177,6 +180,7 @@ BOOST_FIXTURE_TEST_CASE(stale_tip_peer_management, OutboundTest)
     // required time connected check should be satisfied).
     SetMockTime(time_init);
     AddRandomOutboundPeer(id, vNodes, *peerLogic, *connman, ConnectionType::OUTBOUND_FULL_RELAY);
+    BOOST_CHECK_EQUAL(connman->GetExtraFullOutboundCount(), 1);
     SetMockTime(time_later);
 
     peerLogic->CheckForStaleTipAndEvictPeers();
@@ -236,10 +240,12 @@ BOOST_FIXTURE_TEST_CASE(block_relay_only_eviction, OutboundTest)
     auto connman = std::make_unique<ConnmanTestMsg>(0x1337, 0x1337, *m_node.addrman, *m_node.netgroupman, Params());
     auto peerLogic = PeerManager::make(*connman, *m_node.addrman, nullptr, *m_node.chainman, *m_node.mempool, *m_node.warnings, {});
 
-    constexpr int max_outbound_block_relay{MAX_BLOCK_RELAY_ONLY_CONNECTIONS};
+    // Use a non-default target to verify eviction follows the configured value.
+    constexpr int max_outbound_block_relay{1};
     constexpr int64_t MINIMUM_CONNECT_TIME{30};
     CConnman::Options options;
     options.m_max_automatic_connections = DEFAULT_MAX_PEER_CONNECTIONS;
+    options.m_max_outbound_block_relay = max_outbound_block_relay;
 
     connman->Init(options);
     std::vector<CNode*> vNodes;
@@ -248,6 +254,7 @@ BOOST_FIXTURE_TEST_CASE(block_relay_only_eviction, OutboundTest)
     for (int i = 0; i < max_outbound_block_relay; ++i) {
         AddRandomOutboundPeer(id, vNodes, *peerLogic, *connman, ConnectionType::BLOCK_RELAY);
     }
+    BOOST_CHECK_EQUAL(connman->GetExtraBlockRelayCount(), 0);
     peerLogic->CheckForStaleTipAndEvictPeers();
 
     for (int i = 0; i < max_outbound_block_relay; ++i) {
@@ -256,6 +263,7 @@ BOOST_FIXTURE_TEST_CASE(block_relay_only_eviction, OutboundTest)
 
     // Add an extra block-relay-only peer breaking the limit (mocks logic in ThreadOpenConnections)
     AddRandomOutboundPeer(id, vNodes, *peerLogic, *connman, ConnectionType::BLOCK_RELAY);
+    BOOST_CHECK_EQUAL(connman->GetExtraBlockRelayCount(), 1);
     peerLogic->CheckForStaleTipAndEvictPeers();
 
     // The extra peer should only get marked for eviction after MINIMUM_CONNECT_TIME

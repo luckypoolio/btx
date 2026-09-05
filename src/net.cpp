@@ -15,6 +15,7 @@
 #include <common/netif.h>
 #include <compat/compat.h>
 #include <consensus/consensus.h>
+#include <crypto/common.h>
 #include <crypto/sha256.h>
 #include <i2p.h>
 #include <key.h>
@@ -68,6 +69,61 @@ static constexpr size_t MAX_BLOCK_RELAY_ONLY_ANCHORS = 2;
 static_assert (MAX_BLOCK_RELAY_ONLY_ANCHORS <= static_cast<size_t>(MAX_BLOCK_RELAY_ONLY_CONNECTIONS), "MAX_BLOCK_RELAY_ONLY_ANCHORS must not exceed MAX_BLOCK_RELAY_ONLY_CONNECTIONS.");
 /** Anchor IP address database file name */
 const char* const ANCHORS_DATABASE_FILENAME = "anchors.dat";
+
+std::optional<ArchivePendingRecoveryMessage>
+ClassifyArchivePendingRecoveryMessage(std::string_view msg_type,
+                                      Span<const std::byte> payload,
+                                      bool allow_block_getdata)
+{
+    // Messages a normal post-handshake peer commonly puts ahead of its first
+    // GETHEADERS. All are constant-size and cheap to validate/process.
+    if ((msg_type == NetMsgType::SENDHEADERS ||
+         msg_type == NetMsgType::DANDELIONACC ||
+         msg_type == NetMsgType::GETADDR) &&
+        payload.empty()) {
+        return ArchivePendingRecoveryMessage::CONTROL;
+    }
+    if (msg_type == NetMsgType::SENDCMPCT && payload.size() == 9) {
+        return ArchivePendingRecoveryMessage::CONTROL;
+    }
+    if (msg_type == NetMsgType::SENDBLKCHNK && payload.size() == 8) {
+        return ArchivePendingRecoveryMessage::CONTROL;
+    }
+    if (msg_type == NetMsgType::FEEFILTER && payload.size() == 8) {
+        return ArchivePendingRecoveryMessage::CONTROL;
+    }
+    if ((msg_type == NetMsgType::PING || msg_type == NetMsgType::PONG) &&
+        payload.size() <= sizeof(uint64_t)) {
+        return ArchivePendingRecoveryMessage::CONTROL;
+    }
+    // CBlockLocator includes a 4-byte legacy version, at most 101 hashes,
+    // CompactSize framing, and a 32-byte stop hash. Leave a small framing
+    // margin but never admit a general large payload on this path.
+    static constexpr size_t MAX_RECOVERY_LOCATOR_PAYLOAD{4 * 1024};
+    if (msg_type == NetMsgType::GETHEADERS &&
+        payload.size() <= MAX_RECOVERY_LOCATOR_PAYLOAD) {
+        return ArchivePendingRecoveryMessage::CONTROL;
+    }
+
+    if (!allow_block_getdata || msg_type != NetMsgType::GETDATA) {
+        return std::nullopt;
+    }
+
+    // A canonical vector containing exactly one CInv is one-byte count,
+    // four-byte type and 32-byte hash. Inspect the type before consuming the
+    // queue front so TX, filtered/compact block and batched GETDATA cannot use
+    // the retained-history exception.
+    static constexpr size_t SINGLE_INV_PAYLOAD_SIZE{1 + sizeof(uint32_t) + uint256::size()};
+    if (payload.size() != SINGLE_INV_PAYLOAD_SIZE ||
+        std::to_integer<uint8_t>(payload[0]) != 1) {
+        return std::nullopt;
+    }
+    const uint32_t inv_type{ReadLE32(payload.data() + 1)};
+    if (inv_type != MSG_BLOCK && inv_type != MSG_WITNESS_BLOCK) {
+        return std::nullopt;
+    }
+    return ArchivePendingRecoveryMessage::BLOCK_GETDATA;
+}
 
 // How often to dump addresses to peers.dat
 static constexpr std::chrono::minutes DUMP_PEERS_INTERVAL{15};
@@ -3155,15 +3211,16 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, Spa
             conn_type = ConnectionType::FEELER;
             fFeeler = true;
         } else if (nOutboundFullRelay == m_max_outbound_full_relay &&
-                   m_max_outbound_full_relay == MAX_OUTBOUND_FULL_RELAY_CONNECTIONS &&
+                   m_max_outbound_full_relay > 0 &&
+                   m_max_outbound_full_relay == m_configured_max_outbound_full_relay &&
                    now > next_extra_network_peer &&
                    MaybePickPreferredNetwork(preferred_net)) {
             // Full outbound connection management: Attempt to get at least one
             // outbound peer from each reachable network by making extra connections
             // and then protecting "only" peers from a network during outbound eviction.
-            // This is not attempted if the user changed -maxconnections to a value
-            // so low that less than MAX_OUTBOUND_FULL_RELAY_CONNECTIONS are made,
-            // to prevent interactions with otherwise protected outbound peers.
+            // This is not attempted if -maxconnections is too low to satisfy
+            // the configured full-relay target, to prevent interactions with
+            // otherwise protected outbound peers.
             next_extra_network_peer = now + rng.rand_exp_duration(EXTRA_NETWORK_PEER_INTERVAL);
         } else {
             // skip to next iteration of while loop
@@ -3612,6 +3669,19 @@ void CConnman::ThreadMessageHandler()
                             archive_target,
                             pnode->m_consensus_catchup_serve.load(
                                 std::memory_order_relaxed))) {
+                    // Do not let the peer-wide archive-priority gate strand a
+                    // normal client's post-handshake controls, GETHEADERS, or
+                    // an explicitly enabled retained active-chain block
+                    // request. The restricted dispatcher consumes the queue
+                    // front only, skips generic GETDATA/orphan preludes, and
+                    // never reports more work. Share the existing signer cap
+                    // across these public recovery visits.
+                    if (others_processed <
+                            node::matmul_trusted::SIGNER_MSGHAND_OTHER_PER_LOOP &&
+                        m_msgproc->ProcessArchivePendingRecoveryMessage(
+                            pnode, flagInterruptMsgProc)) {
+                        ++others_processed;
+                    }
                     // Do not set fMoreWork: that busy-spins msghand at
                     // ~90% with 148 miner inbounds (live public CPU archive after the
                     // skip patch) and wedges RPC. Archives already ran
@@ -3992,7 +4062,7 @@ bool CConnman::Start(CScheduler& scheduler, const Options& connOptions)
         // initialize semaphore
         semOutbound = std::make_unique<CSemaphore>(std::min(m_max_automatic_outbound, m_max_automatic_connections));
     }
-    if (semAddnode == nullptr) {
+    if (m_max_addnode > 0 && semAddnode == nullptr) {
         // initialize semaphore
         semAddnode = std::make_unique<CSemaphore>(m_max_addnode);
     }
@@ -4018,7 +4088,9 @@ bool CConnman::Start(CScheduler& scheduler, const Options& connOptions)
         threadDNSAddressSeed = std::thread(&util::TraceThread, "dnsseed", [this] { ThreadDNSAddressSeed(); });
 
     // Initiate manual connections
-    threadOpenAddedConnections = std::thread(&util::TraceThread, "addcon", [this] { ThreadOpenAddedConnections(); });
+    if (m_max_addnode > 0) {
+        threadOpenAddedConnections = std::thread(&util::TraceThread, "addcon", [this] { ThreadOpenAddedConnections(); });
+    }
 
     if (connOptions.m_use_addrman_outgoing && !connOptions.m_specified_outgoing.empty()) {
         if (m_client_interface) {
@@ -4028,7 +4100,8 @@ bool CConnman::Start(CScheduler& scheduler, const Options& connOptions)
         }
         return false;
     }
-    if (connOptions.m_use_addrman_outgoing || !connOptions.m_specified_outgoing.empty()) {
+    if (!connOptions.m_specified_outgoing.empty() ||
+        (connOptions.m_use_addrman_outgoing && m_max_automatic_outbound > 0)) {
         threadOpenConnections = std::thread(
             &util::TraceThread, "opencon",
             [this, connect = connOptions.m_specified_outgoing, seed_nodes = std::move(seed_nodes)] { ThreadOpenConnections(connect, seed_nodes); });
@@ -4571,6 +4644,27 @@ bool CNode::HasQueuedProcessMessageType(std::string_view msg_type)
         if (msg.m_type == msg_type) return true;
     }
     return false;
+}
+
+std::optional<std::pair<CNetMessage, ArchivePendingRecoveryMessage>>
+CNode::PollArchivePendingRecoveryMessage(bool allow_block_getdata)
+{
+    LOCK(m_msg_process_queue_mutex);
+    if (m_msg_process_queue.empty()) return std::nullopt;
+
+    CNetMessage& front{m_msg_process_queue.front()};
+    const auto classification{ClassifyArchivePendingRecoveryMessage(
+        front.m_type,
+        Span<const std::byte>{front.m_recv.data(), front.m_recv.size()},
+        allow_block_getdata)};
+    if (!classification) return std::nullopt;
+
+    std::list<CNetMessage> msgs;
+    msgs.splice(msgs.begin(), m_msg_process_queue, m_msg_process_queue.begin());
+    m_msg_process_queue_size -= msgs.front().GetMemoryUsage();
+    fPauseRecv = m_msg_process_queue_size > m_recv_flood_size;
+
+    return std::make_pair(std::move(msgs.front()), *classification);
 }
 
 std::optional<std::pair<CNetMessage, bool>> CNode::PollMessage()

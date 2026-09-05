@@ -27,7 +27,8 @@ enum class ConnectionType {
      * These are the default connections that we use to connect with the
      * network. There is no restriction on what is relayed; by default we relay
      * blocks, addresses & transactions. We automatically attempt to open
-     * MAX_OUTBOUND_FULL_RELAY_CONNECTIONS using addresses from our AddrMan.
+     * the configured full-relay target (default
+     * MAX_OUTBOUND_FULL_RELAY_CONNECTIONS) using addresses from our AddrMan.
      */
     OUTBOUND_FULL_RELAY,
 

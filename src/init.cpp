@@ -733,12 +733,12 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
 
     argsman.AddArg("-dandelion", strprintf("Enable Dandelion++ privacy relay (default: %d)", 1),
                    ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
-    argsman.AddArg("-addnode=<ip>", strprintf("Add a node to connect to and attempt to keep the connection open (see the addnode RPC help for more info). This option can be specified multiple times to add multiple nodes; connections are limited to %u at a time and are counted separately from the -maxconnections limit.", MAX_ADDNODE_CONNECTIONS), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-addnode=<ip>", strprintf("Add a node to connect to and attempt to keep the connection open (see the addnode RPC help for more info). This option can be specified multiple times; up to -maxaddnodeconnections may be connected concurrently (default: %d), separately from -maxconnections.", MAX_ADDNODE_CONNECTIONS), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-asmap=<file>", strprintf("Specify asn mapping used for bucketing of the peers (default: %s). Relative paths will be prefixed by the net-specific datadir location. No map ships in the tree (same as Bitcoin Core); enable once the reachable peer set spans more than one ASN. A stale map can make eclipse easier.", DEFAULT_ASMAP_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-bantime=<n>", strprintf("Default duration (in seconds) of manually configured bans (default: %u)", DEFAULT_MISBEHAVING_BANTIME), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-bind=<addr>[:<port>][=onion]", strprintf("Bind to given address and always listen on it (default: 0.0.0.0). Use [host]:port notation for IPv6. Append =onion to tag any incoming connections to that address and port as incoming Tor connections (default: 127.0.0.1:%u=onion, testnet3: 127.0.0.1:%u=onion, testnet4: 127.0.0.1:%u=onion, signet: 127.0.0.1:%u=onion, regtest: 127.0.0.1:%u=onion, shieldedv2dev: 127.0.0.1:%u=onion)", defaultChainParams->GetDefaultPort() + 1, testnetChainParams->GetDefaultPort() + 1, testnet4ChainParams->GetDefaultPort() + 1, signetChainParams->GetDefaultPort() + 1, regtestChainParams->GetDefaultPort() + 1, shieldedv2devChainParams->GetDefaultPort() + 1), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-cjdnsreachable", "If set, then this host is configured for CJDNS (connecting to fc00::/8 addresses would lead us to the CJDNS network, see doc/cjdns.md) (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
-    argsman.AddArg("-connect=<ip>", "Connect only to the specified node; -noconnect disables automatic connections (the rules for this peer are the same as for -addnode). This option can be specified multiple times to connect to multiple nodes.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-connect=<ip>", "Connect only to the specified node; -noconnect disables automatic connections. Explicit -connect peers do not count against -maxconnections or -maxaddnodeconnections. This option can be specified multiple times to connect to multiple nodes.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-discover", "Discover own IP addresses (default: 1 when listening and no -externalip or -proxy)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-dns", strprintf("Allow DNS lookups for -addnode, -seednode and -connect (default: %u)", DEFAULT_NAME_LOOKUP), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-dnsseed", strprintf("Query for peer addresses via DNS lookup, if low on addresses (default: %u unless -connect used or -maxconnections=0)", DEFAULT_DNSSEED), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
@@ -748,7 +748,11 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-forcednsseed", strprintf("Always query for peer addresses via DNS lookup (default: %u)", DEFAULT_FORCEDNSSEED), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-listen", strprintf("Accept connections from outside (default: %u if no -proxy, -connect or -maxconnections=0)", DEFAULT_LISTEN), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-listenonion", strprintf("Automatically create Tor onion service (default: %d)", DEFAULT_LISTEN_ONION), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
-    argsman.AddArg("-maxconnections=<n>", strprintf("Maintain at most <n> automatic connections to peers (default: %u). This limit does not apply to connections manually added via -addnode or the addnode RPC, which have a separate limit of %u.", DEFAULT_MAX_PEER_CONNECTIONS, MAX_ADDNODE_CONNECTIONS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-maxconnections=<n>", strprintf("Maintain at most <n> automatic and inbound peer connections (default: %u). Raising the outbound targets below reduces the inbound slots available inside this limit. Persistent -addnode and explicit -connect connections do not count against this limit.", DEFAULT_MAX_PEER_CONNECTIONS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-maxoutboundfullrelay=<n>", strprintf("Steady-state target of <n> automatic full-relay outbound peers, constrained by -maxconnections (default: %d). A value of 0 disables steady peers of this class, but stale-tip probes may still open one temporary peer when capacity permits", MAX_OUTBOUND_FULL_RELAY_CONNECTIONS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-maxoutboundblockrelay=<n>", strprintf("Steady-state target of <n> automatic block-relay-only outbound peers, constrained by -maxconnections after full-relay peers (default: %d). A value of 0 disables steady peers of this class, but partition-detection probes may still open one temporary peer when capacity permits", MAX_BLOCK_RELAY_ONLY_CONNECTIONS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-maxaddnodeconnections=<n>", strprintf("Maintain at most <n> concurrent persistent -addnode/RPC addnode peers, counted separately from -maxconnections (default: %d)", MAX_ADDNODE_CONNECTIONS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-serveretainedhistoricalblocks", "Allow a pruned NODE_NETWORK_LIMITED node to serve requested active-chain block bodies older than the advertised 288-block window when those bodies are still present locally. This exposes the retained range and may increase disk/network load; it does not advertise NODE_NETWORK or restore pruned data (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-maxreceivebuffer=<n>", strprintf("Maximum per-connection receive buffer, <n>*1000 bytes (default: %u)", DEFAULT_MAXRECEIVEBUFFER), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-maxsendbuffer=<n>", strprintf("Maximum per-connection memory usage for the send buffer, <n>*1000 bytes (default: %u)", DEFAULT_MAXSENDBUFFER), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-maxuploadtarget=<n>", strprintf("Tries to keep outbound traffic under the given target per 24h. Limit does not apply to peers with 'download' permission or blocks created within past week. 0 = no limit (default: %s). Optional suffix units [k|K|m|M|g|G|t|T] (default: M). Lowercase is 1000 base while uppercase is 1024 base", DEFAULT_MAX_UPLOAD_TARGET), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
@@ -1921,13 +1925,67 @@ bool AppInitParameterInteraction(const ArgsManager& args)
 
     // Number of bound interfaces (we have at least one)
     int nBind = std::max(nUserBind, size_t(1));
-    // Maximum number of connections with other nodes, this accounts for all types of outbounds and inbounds except for manual
-    int user_max_connection = args.GetIntArg("-maxconnections", DEFAULT_MAX_PEER_CONNECTIONS);
-    if (user_max_connection < 0) {
-        return InitError(Untranslated("-maxconnections must be greater or equal than zero"));
+    auto read_nonnegative_connection_limit = [&](const char* arg_name, int default_value, int& result) {
+        const int64_t value{args.GetIntArg(arg_name, default_value)};
+        if (value < 0 || value > std::numeric_limits<int>::max()) {
+            return InitError(Untranslated(strprintf("%s must be between 0 and %d", arg_name, std::numeric_limits<int>::max())));
+        }
+        result = static_cast<int>(value);
+        return true;
+    };
+
+    // Maximum number of connections with other nodes. This accounts for all
+    // automatic outbounds and inbounds; persistent addnodes and explicit
+    // -connect peers are manual and outside this limit.
+    int user_max_connection{0};
+    int max_outbound_full_relay{0};
+    int max_outbound_block_relay{0};
+    int max_addnode_connections{0};
+    if (!read_nonnegative_connection_limit("-maxconnections", DEFAULT_MAX_PEER_CONNECTIONS, user_max_connection) ||
+        !read_nonnegative_connection_limit("-maxoutboundfullrelay", MAX_OUTBOUND_FULL_RELAY_CONNECTIONS, max_outbound_full_relay) ||
+        !read_nonnegative_connection_limit("-maxoutboundblockrelay", MAX_BLOCK_RELAY_ONLY_CONNECTIONS, max_outbound_block_relay) ||
+        !read_nonnegative_connection_limit("-maxaddnodeconnections", MAX_ADDNODE_CONNECTIONS, max_addnode_connections)) {
+        return false;
     }
-    // Reserve enough FDs to account for the bare minimum, plus any manual connections, plus the bound interfaces
-    int min_required_fds = MIN_CORE_FDS + MAX_ADDNODE_CONNECTIONS + nBind;
+    const auto effective_connection_limits{CalculateConnectionLimits(
+        user_max_connection,
+        max_outbound_full_relay,
+        max_outbound_block_relay,
+        max_addnode_connections)};
+    if (user_max_connection > 0 &&
+        (effective_connection_limits.max_outbound_full_relay != max_outbound_full_relay ||
+         effective_connection_limits.max_outbound_block_relay != max_outbound_block_relay)) {
+        InitWarning(strprintf(
+            _("Constraining outbound targets to %d full-relay and %d block-relay peers within -maxconnections=%d."),
+            effective_connection_limits.max_outbound_full_relay,
+            effective_connection_limits.max_outbound_block_relay,
+            user_max_connection));
+    }
+    size_t explicit_connect_targets{0};
+    for (const std::string& target : args.GetArgs("-connect")) {
+        const std::string normalized{ToLower(util::TrimString(target))};
+        if (normalized != "0" && normalized != "false" &&
+            normalized != "1" && normalized != "true") {
+            ++explicit_connect_targets;
+        }
+    }
+    if (explicit_connect_targets > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        max_addnode_connections > std::numeric_limits<int>::max() - static_cast<int>(explicit_connect_targets)) {
+        return InitError(Untranslated("The combined -connect and -maxaddnodeconnections limits are too large for file-descriptor accounting"));
+    }
+    const int max_manual_connections{
+        max_addnode_connections + static_cast<int>(explicit_connect_targets)};
+    if (max_manual_connections > std::numeric_limits<int>::max() - MIN_CORE_FDS - nBind) {
+        return InitError(Untranslated("The manual connection limit is too large for file-descriptor accounting"));
+    }
+    // Reserve enough FDs for the bare minimum, persistent addnodes, strict
+    // -connect targets, and bound interfaces. Strict targets bypass both
+    // -maxconnections and the addnode semaphore.
+    int min_required_fds = MIN_CORE_FDS + max_manual_connections + nBind;
+
+    if (user_max_connection > std::numeric_limits<int>::max() - min_required_fds) {
+        return InitError(Untranslated("-maxconnections is too large for file-descriptor accounting"));
+    }
 
     // Try raising the FD limit to what we need (available_fds may be smaller than the requested amount if this fails)
     available_fds = RaiseFileDescriptorLimit(user_max_connection + min_required_fds);
@@ -3460,6 +3518,12 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     CConnman::Options connOptions;
     connOptions.m_local_services = g_local_services;
     connOptions.m_max_automatic_connections = nMaxConnections;
+    connOptions.m_max_outbound_full_relay = static_cast<int>(
+        args.GetIntArg("-maxoutboundfullrelay", MAX_OUTBOUND_FULL_RELAY_CONNECTIONS));
+    connOptions.m_max_outbound_block_relay = static_cast<int>(
+        args.GetIntArg("-maxoutboundblockrelay", MAX_BLOCK_RELAY_ONLY_CONNECTIONS));
+    connOptions.m_max_addnode = static_cast<int>(
+        args.GetIntArg("-maxaddnodeconnections", MAX_ADDNODE_CONNECTIONS));
     connOptions.uiInterface = &uiInterface;
     connOptions.m_banman = node.banman.get();
     connOptions.m_msgproc = node.peerman.get();

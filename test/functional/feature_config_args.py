@@ -416,6 +416,32 @@ class ConfArgsTest(BitcoinTestFramework):
                 self.restart_node(0, extra_args=[connect_arg, '-dnsseed', '-proxy=localhost:1080'])
         self.stop_node(0)
 
+    def test_connection_limit_args(self):
+        self.log.info('Test configurable connection limits')
+        for name in [
+            'maxconnections',
+            'maxoutboundfullrelay',
+            'maxoutboundblockrelay',
+            'maxaddnodeconnections',
+        ]:
+            self.nodes[0].assert_start_raises_init_error(
+                extra_args=[f'-{name}=-1'],
+                expected_msg=f'Error: -{name} must be between 0 and 2147483647',
+            )
+
+        self.start_node(0, extra_args=[
+            '-maxconnections=20',
+            '-maxoutboundfullrelay=12',
+            '-maxoutboundblockrelay=4',
+            '-maxaddnodeconnections=0',
+        ])
+        self.stop_node(0)
+
+        # Zero automatic capacity must not leave the outbound thread blocked
+        # on a zero-count semaphore during shutdown.
+        self.start_node(0, extra_args=['-maxconnections=0'])
+        self.stop_node(0)
+
     def test_ignored_conf(self):
         self.log.info('Test error is triggered when the datadir in use contains a bitcoin.conf file that would be ignored '
                       'because a conflicting -conf file argument is passed.')
@@ -501,6 +527,7 @@ class ConfArgsTest(BitcoinTestFramework):
         self.test_seed_peers()
         self.test_networkactive()
         self.test_connect_with_seednode()
+        self.test_connection_limit_args()
 
         self.test_dir_config()
         self.test_negated_config()
