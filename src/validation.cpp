@@ -12500,7 +12500,9 @@ const CBlockIndex* ChainstateManager::FindUniqueCompetingAttestedIndex() const
         }
         competing.push_back(idx);
     };
-    for (const auto& hint : node::matmul_trusted::AttestedFrontierHints()) {
+    const auto frontier_hints{
+        node::matmul_trusted::AttestedFrontierHints()};
+    for (const auto& hint : frontier_hints) {
         consider(m_blockman.LookupBlockIndex(hint.hash));
     }
     for (CBlockIndex* idx : m_reorg_authenticated_candidate_tips) {
@@ -12574,6 +12576,57 @@ const CBlockIndex* ChainstateManager::FindUniqueCompetingAttestedIndex() const
                 return nullptr;
             }
             competing = std::move(frontier_ahead);
+        }
+    }
+
+    // A unique quorum frontier strictly above an incomparable, lower
+    // attested branch supersedes that stale history. This is the normal
+    // durable-store shape after an attestor reorg: mirrors retain the old
+    // valid statement for audit, then learn a higher statement on the branch
+    // the attestor now follows. Treating both as live alternatives forever
+    // leaves FindUnique with no answer and freezes block download at the
+    // first HAVE_DATA-but-unconnected body.
+    //
+    // Do not turn last-writer into fork choice. If more than one hash has
+    // quorum at HighestAttestedHeight, or an incomparable candidate reaches
+    // that height, keep the existing fail-closed behavior below. Likewise, a
+    // higher HEADER_ONLY frontier can suppress stale adoption but cannot
+    // nominate a candidate until a body on its lineage is available.
+    if (const auto frontier_height{
+            node::matmul_trusted::HighestAttestedHeight()};
+        frontier_height.has_value()) {
+        std::set<uint256> frontier_hashes;
+        for (const auto& hint : frontier_hints) {
+            if (hint.height == *frontier_height && !hint.hash.IsNull() &&
+                node::matmul_trusted::HasQuorumInMemory(
+                    hint.hash, hint.height)) {
+                frontier_hashes.insert(hint.hash);
+            }
+        }
+        if (frontier_hashes.size() == 1) {
+            const CBlockIndex* const frontier{
+                m_blockman.LookupBlockIndex(*frontier_hashes.begin())};
+            if (frontier != nullptr &&
+                (frontier->nStatus & BLOCK_FAILED_MASK) == 0) {
+                std::vector<const CBlockIndex*> frontier_lineage;
+                frontier_lineage.reserve(competing.size());
+                bool saw_stale_incomparable{false};
+                bool may_supersede{true};
+                for (const CBlockIndex* idx : competing) {
+                    if (BlockIndexComparable(idx, frontier)) {
+                        frontier_lineage.push_back(idx);
+                        continue;
+                    }
+                    if (idx->nHeight >= frontier->nHeight) {
+                        may_supersede = false;
+                        break;
+                    }
+                    saw_stale_incomparable = true;
+                }
+                if (may_supersede && saw_stale_incomparable) {
+                    competing = std::move(frontier_lineage);
+                }
+            }
         }
     }
 

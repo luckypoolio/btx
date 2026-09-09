@@ -1874,7 +1874,10 @@ public:
      * When the active tip has no quorum: abandon a lost race (equal-work
      * attested sibling) or a heavier unattested fork. Empty if the only
      * attested index is on the active chain (pending-attestation extension
-     * — do not disconnect it) or if two incomparable attested branches exist.
+     * — do not disconnect it) or if two incomparable live-frontier branches
+     * exist. A unique quorum hash at HighestAttestedHeight supersedes strictly
+     * lower incomparable attestations retained as durable audit history;
+     * multiple hashes at the highest height remain fail-closed.
      *
      * When the active tip already has quorum: still return a unique
      * competing attested HAVE_DATA short-reorg fork-child (every frontier

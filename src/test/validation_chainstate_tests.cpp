@@ -2237,6 +2237,203 @@ BOOST_FIXTURE_TEST_CASE(chainstate_shutdown_interrupt_does_not_spin_activatebest
     chainman.CheckBlockIndex();
 }
 
+BOOST_FIXTURE_TEST_CASE(chainstate_unique_higher_frontier_supersedes_stale_incomparable_history_after_restart, TestChain100Setup)
+{
+    // A trusted mirror keeps durable attestations as audit history. After the
+    // signer reorgs, a lower statement on the abandoned branch and a higher
+    // statement on the current branch are both valid quorums. The unique
+    // highest frontier must supersede the stale lower branch; otherwise the
+    // incomparable pair makes FindUnique return nullptr forever.
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    Chainstate& chainstate = chainman.ActiveChainstate();
+    auto& mode = const_cast<kernel::MatMulValidationMode&>(
+        chainman.m_options.matmul_validation_mode);
+    const auto saved_mode{mode};
+    struct Restore {
+        kernel::MatMulValidationMode& mode;
+        kernel::MatMulValidationMode saved_mode;
+        ~Restore()
+        {
+            node::matmul_trusted::ResetForTest();
+            mode = saved_mode;
+        }
+    } restore{mode, saved_mode};
+    mode = kernel::MatMulValidationMode::TRUSTED;
+
+    CBlockIndex* const active_tip{
+        WITH_LOCK(::cs_main, return chainstate.m_chain.Tip())};
+    BOOST_REQUIRE(active_tip != nullptr);
+    CBlockIndex* const lca{active_tip->pprev};
+    BOOST_REQUIRE(lca != nullptr);
+
+    CKey stale_dest;
+    stale_dest.MakeNewKey(/*fCompressed=*/true);
+    CKey current_dest;
+    current_dest.MakeNewKey(/*fCompressed=*/true);
+    const CScript stale_script =
+        GetScriptForDestination(PKHash(stale_dest.GetPubKey()));
+    const CScript current_script =
+        GetScriptForDestination(PKHash(current_dest.GetPubKey()));
+
+    BlockValidationState state;
+    BOOST_REQUIRE(chainstate.InvalidateBlock(state, active_tip));
+    BOOST_REQUIRE(WITH_LOCK(::cs_main, return chainstate.m_chain.Tip()) == lca);
+
+    std::vector<CBlockIndex*> stale_branch;
+    for (int i = 0; i < 3; ++i) {
+        const CBlock block{CreateAndProcessBlock({}, stale_script)};
+        stale_branch.push_back(WITH_LOCK(::cs_main, {
+            return chainman.m_blockman.LookupBlockIndex(block.GetHash());
+        }));
+        BOOST_REQUIRE(stale_branch.back() != nullptr);
+    }
+    state = BlockValidationState{};
+    BOOST_REQUIRE(chainstate.InvalidateBlock(state, stale_branch.front()));
+    BOOST_REQUIRE(WITH_LOCK(::cs_main, return chainstate.m_chain.Tip()) == lca);
+
+    std::vector<CBlockIndex*> current_branch;
+    for (int i = 0; i < 3; ++i) {
+        const CBlock block{CreateAndProcessBlock({}, current_script)};
+        current_branch.push_back(WITH_LOCK(::cs_main, {
+            return chainman.m_blockman.LookupBlockIndex(block.GetHash());
+        }));
+        BOOST_REQUIRE(current_branch.back() != nullptr);
+    }
+    state = BlockValidationState{};
+    BOOST_REQUIRE(chainstate.InvalidateBlock(state, current_branch.front()));
+    BOOST_REQUIRE(WITH_LOCK(::cs_main, return chainstate.m_chain.Tip()) == lca);
+
+    {
+        LOCK(::cs_main);
+        chainstate.ResetBlockFailureFlags(active_tip);
+    }
+    state = BlockValidationState{};
+    BOOST_REQUIRE(chainstate.ActivateBestChain(state));
+    BOOST_REQUIRE(WITH_LOCK(::cs_main, return chainstate.m_chain.Tip()) ==
+                  active_tip);
+    {
+        LOCK(::cs_main);
+        chainstate.ResetBlockFailureFlags(stale_branch.front());
+        chainstate.ResetBlockFailureFlags(current_branch.front());
+        BOOST_REQUIRE(stale_branch.front()->nHeight == active_tip->nHeight);
+        BOOST_REQUIRE(current_branch.back()->nHeight >
+                      stale_branch.front()->nHeight);
+        BOOST_REQUIRE(LastCommonAncestor(stale_branch.front(),
+                                         current_branch.back()) == lca);
+    }
+
+    CKey signer;
+    signer.MakeNewKey(/*fCompressed=*/true);
+    const uint256 chain_id{uint256::ONE};
+    const uint256 replay_ctx{
+        uint256::FromHex(std::string(64, '7')).value()};
+    auto configure = [&] {
+        matmul::trusted::StoreConfig config;
+        config.chain_id = chain_id;
+        config.replay_authority_context = replay_ctx;
+        config.trusted_signers = {signer.GetPubKey()};
+        config.threshold = 1;
+        std::string configure_error;
+        BOOST_REQUIRE(node::matmul_trusted::Configure(
+            std::move(config), /*trusted_mirror=*/true, /*serve=*/false,
+            std::chrono::milliseconds{50}, configure_error));
+    };
+    const fs::path archive{
+        m_args.GetDataDirNet() /
+        "matmul_attestations_stale_incomparable_frontier.dat"};
+    configure();
+    std::string error;
+    BOOST_REQUIRE(node::matmul_trusted::OpenPersistence(archive, error));
+    BOOST_REQUIRE(InjectHistoricalAttestation(
+                      signer, chain_id, replay_ctx,
+                      stale_branch.front()->GetBlockHash(),
+                      stale_branch.front()->nHeight) ==
+                  matmul::trusted::AddResult::Accepted);
+    BOOST_REQUIRE(InjectHistoricalAttestation(
+                      signer, chain_id, replay_ctx,
+                      current_branch.back()->GetBlockHash(),
+                      current_branch.back()->nHeight) ==
+                  matmul::trusted::AddResult::Accepted);
+    BOOST_REQUIRE(node::matmul_trusted::FlushPersistence(error));
+
+    {
+        LOCK(::cs_main);
+        BOOST_REQUIRE(node::matmul_trusted::HighestAttestedHeight().has_value());
+        BOOST_CHECK_EQUAL(*node::matmul_trusted::HighestAttestedHeight(),
+                          current_branch.back()->nHeight);
+        BOOST_CHECK_EQUAL(chainman.FindUniqueCompetingAttestedIndex(),
+                          current_branch.back());
+    }
+
+    // Recreate the process-local store from disk. Both branch statements are
+    // restored, proving the durable audit record does not re-arm the freeze.
+    node::matmul_trusted::ResetForTest();
+    configure();
+    error.clear();
+    BOOST_REQUIRE(node::matmul_trusted::OpenPersistence(archive, error));
+    {
+        LOCK(::cs_main);
+        BOOST_REQUIRE(node::matmul_trusted::HasQuorum(
+            stale_branch.front()->GetBlockHash(),
+            stale_branch.front()->nHeight));
+        BOOST_REQUIRE(node::matmul_trusted::HasQuorum(
+            current_branch.back()->GetBlockHash(),
+            current_branch.back()->nHeight));
+        BOOST_CHECK_EQUAL(chainman.FindUniqueCompetingAttestedIndex(),
+                          current_branch.back());
+    }
+
+    // The supersession rule must not choose between two hashes at the
+    // highest height. Reconfigure under a different authority namespace so
+    // this ambiguity check cannot mutate the durable restart fixture above.
+    node::matmul_trusted::ResetForTest();
+    const uint256 ambiguous_ctx{
+        uint256::FromHex(std::string(64, '8')).value()};
+    {
+        matmul::trusted::StoreConfig config;
+        config.chain_id = chain_id;
+        config.replay_authority_context = ambiguous_ctx;
+        config.trusted_signers = {signer.GetPubKey()};
+        config.threshold = 1;
+        std::string configure_error;
+        BOOST_REQUIRE(node::matmul_trusted::Configure(
+            std::move(config), /*trusted_mirror=*/true, /*serve=*/false,
+            std::chrono::milliseconds{50}, configure_error));
+    }
+    BOOST_REQUIRE_EQUAL(stale_branch.back()->nHeight,
+                        current_branch.back()->nHeight);
+    BOOST_REQUIRE(InjectHistoricalAttestation(
+                      signer, chain_id, ambiguous_ctx,
+                      stale_branch.back()->GetBlockHash(),
+                      stale_branch.back()->nHeight) ==
+                  matmul::trusted::AddResult::Accepted);
+    BOOST_REQUIRE(InjectHistoricalAttestation(
+                      signer, chain_id, ambiguous_ctx,
+                      current_branch.back()->GetBlockHash(),
+                      current_branch.back()->nHeight) ==
+                  matmul::trusted::AddResult::Accepted);
+    BOOST_CHECK(WITH_LOCK(
+        ::cs_main,
+        return chainman.FindUniqueCompetingAttestedIndex()) == nullptr);
+
+    // Return to the durable unique-frontier namespace for the end-to-end ABC
+    // assertion. The ambiguous namespace above remains fail-closed.
+    node::matmul_trusted::ResetForTest();
+    configure();
+    error.clear();
+    BOOST_REQUIRE(node::matmul_trusted::OpenPersistence(archive, error));
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(::cs_main,
+                  return chainman.FindUniqueCompetingAttestedIndex()),
+        current_branch.back());
+
+    state = BlockValidationState{};
+    BOOST_REQUIRE(chainstate.ActivateBestChain(state));
+    BOOST_CHECK(WITH_LOCK(::cs_main, return chainstate.m_chain.Tip()) ==
+                current_branch.back());
+    chainman.CheckBlockIndex();
+}
+
 BOOST_FIXTURE_TEST_CASE(chainstate_dual_quorum_sibling_follows_signed_frontier, TestChain100Setup)
 {
     // Live 2026-08-15: signer attested both 189489 siblings; trusted
