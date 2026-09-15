@@ -79,6 +79,7 @@
 #include <set>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 #include <typeinfo>
@@ -1477,6 +1478,11 @@ public:
             LOCK(cs_main);
             m_header_only_competing.clear();
             m_header_only_followed_skip.clear();
+            m_last_root_first_summary = 0us;
+            m_stuck_root_hash.SetNull();
+            m_stuck_root_since_s = 0;
+            m_autofetch_root_hash.SetNull();
+            m_autofetch_tried.clear();
         }
         {
             LOCK(m_matmul_rc_admission_mutex);
@@ -1533,6 +1539,18 @@ public:
         EXCLUSIVE_LOCKS_REQUIRED(!cs_main, !NetEventsInterface::g_msgproc_mutex)
     {
         RetryMatMulDeferredBodies();
+    }
+    void AutoFetchStuckTipRootForTest() override
+        EXCLUSIVE_LOCKS_REQUIRED(!cs_main, !m_peer_mutex)
+    {
+        AutoFetchStuckTipRoot();
+    }
+    bool IsBlockRequestedFromPeerForTest(
+        const uint256& hash, NodeId peer_id) override
+        EXCLUSIVE_LOCKS_REQUIRED(!cs_main)
+    {
+        LOCK(cs_main);
+        return IsBlockRequestedFromPeer(hash, peer_id);
     }
     void PersistExactReplayVerdictAndRelayForTest(const uint256& hash) override
         EXCLUSIVE_LOCKS_REQUIRED(!cs_main)
@@ -2109,15 +2127,21 @@ private:
     void RetryMatMulDeferredBodies()
         EXCLUSIVE_LOCKS_REQUIRED(!cs_main,
                                  !NetEventsInterface::g_msgproc_mutex);
-    /** Break a served-body-tip wedge: when the active-chain tip+1 body has been
-     *  stuck in flight past BLOCK_ROOT_BODY_TIP_STUCK_S, re-request it BY HASH
-     *  from peers advertising past our tip (they may hold the canonical body off
-     *  an advertised competing tower, invisible to the branch-gated selector),
-     *  rotating one peer per call. This is the automatic form of a manual
-     *  getblockfrompeer; getdata is by hash and ExactReplay still gates
-     *  acceptance, so no wrong body can be admitted. Runs from the scheduler
+    /** Break a served-body-tip wedge by re-requesting an actionable recovery
+     *  root BY HASH: either a tip+1 body stuck past
+     *  BLOCK_ROOT_BODY_TIP_STUCK_S, or immediately the quorum-approved first
+     *  hole of a short reorg. Rotate over peers that can serve blocks,
+     *  preferring exact ancestry, full archives, and prior body delivery.
+     *  This is the automatic form of a manual getblockfrompeer; ExactReplay
+     *  still gates acceptance, so no
+     *  unapproved competing body can be admitted. Runs from the scheduler
      *  (holds neither cs_main nor m_peer_mutex on entry). */
     void AutoFetchStuckTipRoot()
+        EXCLUSIVE_LOCKS_REQUIRED(!cs_main, !m_peer_mutex);
+    /** Queue a watchdog GETDATA only if the root is still actionable and no
+     *  fresh normal request appeared after peer selection. */
+    std::optional<std::string> FetchActionableRecoveryBlock(
+        NodeId peer_id, const uint256& hash, const CBlockIndex* expected_index)
         EXCLUSIVE_LOCKS_REQUIRED(!cs_main, !m_peer_mutex);
     std::atomic<std::chrono::seconds> m_matmul_deferred_retry_at{0s};
     /** Pending-slot destruction may happen on a worker thread. Each pool
@@ -2914,8 +2938,8 @@ private:
      *  broken. */
     uint256 m_stuck_root_hash GUARDED_BY(cs_main);
     int64_t m_stuck_root_since_s GUARDED_BY(cs_main){0};
-    //! Active-chain tip+1 whose body is stuck in flight past the served-body-
-    //! tip threshold; the getdata auto-fetch rotation targets exactly this hash.
+    //! Actionable recovery root (stuck active-chain tip+1 or quorum-approved
+    //! short-reorg first hole) targeted by the getdata auto-fetch rotation.
     uint256 m_autofetch_root_hash GUARDED_BY(cs_main);
     //! Peers already tried this rotation for m_autofetch_root_hash (cleared when
     //! the stuck root changes or the rotation is exhausted).
@@ -3463,6 +3487,15 @@ void PeerManagerImpl::RefreshMatMulDeferredBodyRetry(
     const ChainstateManager& chainman)
     EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
+[[nodiscard]] static bool IsHeaderOnlyFetchSuppressed(
+    const ChainstateManager& chainman,
+    const CBlockIndex* tip,
+    const CBlockIndex* index,
+    const std::set<uint256>& competing,
+    const std::set<uint256>& followed_skip,
+    const CBlockIndex* peer_best_known)
+    EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
 //! RB-16 ORDER: parent-connectable predicate shared by the root-first
 //! frontier driver, the covered-body ExactReplay admission gate, and the
 //! RC progress-lane assignment. A body on the acquired tower can only ever
@@ -3581,6 +3614,92 @@ static constexpr int64_t MATMUL_ACQ_FRONTIER_REPLAY_MIN_GAP_S{2};
     return lowest;
 }
 
+std::optional<std::string> PeerManagerImpl::FetchActionableRecoveryBlock(
+    NodeId peer_id, const uint256& hash, const CBlockIndex* expected_index)
+{
+    if (m_chainman.m_blockman.LoadingBlocks()) return "Loading blocks ...";
+
+    LOCK(cs_main);
+    if (m_stopping.load(std::memory_order_acquire)) return "Peer manager is stopping";
+    const CBlockIndex* const tip{m_chainman.ActiveChain().Tip()};
+    const CBlockIndex* const index{
+        m_chainman.m_blockman.LookupBlockIndex(hash)};
+    if (tip == nullptr || index == nullptr || index != expected_index) {
+        return "Recovery root changed";
+    }
+    const bool actionable{
+        IndexIsFollowedTipChild(m_chainman, tip, index) ||
+        IndexIsShortReorgAttestedForkChild(m_chainman, tip, index)};
+    if (!actionable || (index->nStatus & BLOCK_HAVE_DATA) != 0 ||
+        (index->nStatus & BLOCK_FAILED_MASK) != 0 ||
+        IsHeaderOnlyFetchSuppressed(
+            m_chainman, tip, index, m_header_only_competing,
+            m_header_only_followed_skip, /*peer_best_known=*/nullptr)) {
+        return "Recovery root is no longer actionable";
+    }
+
+    const auto now{GetTime<std::chrono::microseconds>()};
+    if (m_matmul_block_lifecycle.HasRetainedBody(hash) ||
+        m_matmul_block_lifecycle.ShouldSkipFetchWhileAsyncPending(
+            hash, /*have_data=*/false) ||
+        IsMatMulBudgetDeferred(hash, now)) {
+        return "Recovery root body is already pending";
+    }
+    // A normal download pass may have filled the gap between watchdog peer
+    // selection and this lock acquisition. Never replace that fresh request.
+    if (IsBlockRequested(hash)) return "Recovery root was requested concurrently";
+
+    CNodeState* const state{State(peer_id)};
+    PeerRef peer{GetPeerRef(peer_id)};
+    if (state == nullptr || peer == nullptr) return "Peer does not exist";
+    if (!CanServeWitnesses(*peer)) return "Pre-SegWit peer";
+    if (state->vBlocksInFlight.size() >= MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
+        return "Peer block download queue is full";
+    }
+    const bool gpu_authority{PeerIsGpuAuthority(peer_id, *state)};
+    if (now < state->m_block_download_paused_until ||
+        !node::matmul_trusted::StalledTowerFetchPeerMayServeBodies(
+            gpu_authority, state->m_can_serve_blocks,
+            /*version_handshake_complete=*/state->m_starting_height >= 0,
+            state->m_manual, state->m_noban)) {
+        return "Peer cannot currently serve recovery blocks";
+    }
+    const int best_known_height{
+        state->pindexBestKnownBlock != nullptr
+            ? state->pindexBestKnownBlock->nHeight
+            : -1};
+    const int advertised_height{
+        std::max(state->m_starting_height, best_known_height)};
+    const bool exact_ancestry{
+        state->pindexBestKnownBlock != nullptr &&
+        best_known_height >= index->nHeight &&
+        state->pindexBestKnownBlock->GetAncestor(index->nHeight) == index};
+    if (!exact_ancestry && advertised_height < index->nHeight) {
+        return "Peer no longer advertises the recovery height";
+    }
+    if (state->m_can_serve_blocks && !state->m_node_network &&
+        advertised_height >= index->nHeight &&
+        advertised_height - index->nHeight >=
+            static_cast<int>(MIN_BLOCKS_TO_KEEP)) {
+        return "Recovery root is outside the limited peer serving window";
+    }
+
+    Assume(BlockRequested(peer_id, *index));
+    std::vector<CInv> invs{CInv(MSG_BLOCK | MSG_WITNESS_FLAG, hash)};
+    const bool success{m_connman.ForNode(peer_id, [this, &invs](CNode* node) {
+        if (node->fPauseSend || node->fDisconnect) return false;
+        MakeAndPushMessage(*node, NetMsgType::GETDATA, invs);
+        return true;
+    })};
+    if (!success) {
+        RemoveBlockRequest(hash, peer_id);
+        return "Peer not fully connected or send queue paused";
+    }
+    LogDebug(BCLog::NET, "Requesting recovery block %s from peer=%d\n",
+             hash.ToString(), peer_id);
+    return std::nullopt;
+}
+
 void PeerManagerImpl::AutoFetchStuckTipRoot()
 {
     if (m_stopping.load(std::memory_order_acquire)) return;
@@ -3591,33 +3710,172 @@ void PeerManagerImpl::AutoFetchStuckTipRoot()
     size_t candidate_count{0};
     {
         LOCK(cs_main);
-        if (m_autofetch_root_hash.IsNull()) return;
         const CBlockIndex* const tip{m_chainman.ActiveChain().Tip()};
-        root_index = m_chainman.m_blockman.LookupBlockIndex(m_autofetch_root_hash);
-        // Only chase a genuinely-fetchable canonical tip+1 whose body we still
-        // lack. Drop the arm once it connects (HAVE_DATA), is no longer the tip
-        // child, has FAILED ExactReplay (audit F1: otherwise its full body is
-        // re-pulled every tick forever, since a failed block never gains
-        // HAVE_DATA), or is a HEADER_ONLY-suppressed competing sibling the normal
-        // selector already refused (audit F2: m_header_only_competing). Getdata
-        // by hash still means a wrong body cannot be admitted, but re-requesting
-        // an unadmittable root wastes a full-body transfer per rotation cycle.
-        if (tip == nullptr || root_index == nullptr ||
-            root_index->pprev != tip ||
-            (root_index->nStatus & BLOCK_HAVE_DATA) != 0 ||
-            (root_index->nStatus & BLOCK_FAILED_MASK) != 0 ||
-            m_header_only_competing.count(m_autofetch_root_hash) != 0) {
+        if (tip == nullptr) return;
+        const auto now{GetTime<std::chrono::microseconds>()};
+        const int64_t now_s{
+            std::chrono::duration_cast<std::chrono::seconds>(now).count()};
+        const CBlockIndex* desired_root{nullptr};
+
+        // Track the followed tip child here, outside per-peer diagnostics.
+        // The old arming path ran only when a peer was at least two headers
+        // ahead, so a lone missing tip+1 body could never reach the watchdog.
+        const CBlockIndex* const best_header{m_chainman.m_best_header};
+        const CBlockIndex* const followed_root{
+            best_header != nullptr && best_header->nHeight > tip->nHeight &&
+                    best_header->GetAncestor(tip->nHeight) == tip
+                ? best_header->GetAncestor(tip->nHeight + 1)
+                : nullptr};
+        if (followed_root != nullptr &&
+            IndexIsFollowedTipChild(m_chainman, tip, followed_root) &&
+            (followed_root->nStatus & BLOCK_HAVE_DATA) == 0 &&
+            (followed_root->nStatus & BLOCK_FAILED_MASK) == 0 &&
+            !m_matmul_block_lifecycle.HasRetainedBody(
+                followed_root->GetBlockHash())) {
+            const uint256 followed_hash{followed_root->GetBlockHash()};
+            if (m_stuck_root_hash != followed_hash) {
+                m_stuck_root_hash = followed_hash;
+                m_stuck_root_since_s = now_s;
+            }
+            if (now_s - m_stuck_root_since_s >=
+                BLOCK_ROOT_BODY_TIP_STUCK_S) {
+                desired_root = followed_root;
+            }
+        } else {
+            m_stuck_root_hash.SetNull();
+            m_stuck_root_since_s = now_s;
+        }
+
+        // AdvanceLastCommonPastActiveTip intentionally drops a same-height
+        // sibling hole so arbitrary equal-work twins cannot consume download
+        // or ExactReplay capacity. The one safe exception is the first fork
+        // child selected by a signed/quorum-approved short reorg. Nominate it
+        // immediately here (quorum is the authorization); otherwise the
+        // generic root-first timer can never see it and the node waits forever
+        // for a body it never requested.
+        const CBlockIndex* const short_reorg_root{
+            FindShortReorgAttestedForkChild(m_chainman)};
+        if (short_reorg_root != nullptr &&
+            (short_reorg_root->nStatus & BLOCK_HAVE_DATA) == 0 &&
+            (short_reorg_root->nStatus & BLOCK_FAILED_MASK) == 0 &&
+            !m_matmul_block_lifecycle.HasRetainedBody(
+                short_reorg_root->GetBlockHash())) {
+            // Quorum approval makes the short-reorg hole more urgent than an
+            // aged followed child. Pick one desired root per scheduler pass so
+            // the other candidate cannot reset this root's peer rotation.
+            desired_root = short_reorg_root;
+        }
+
+        if (desired_root == nullptr) {
             m_autofetch_root_hash.SetNull();
             m_autofetch_tried.clear();
             return;
         }
-        int best_h{-1};
+        const uint256 desired_hash{desired_root->GetBlockHash()};
+        if (m_autofetch_root_hash != desired_hash) {
+            m_autofetch_root_hash = desired_hash;
+            m_autofetch_tried.clear();
+        }
+        root_index = desired_root;
+        const bool short_reorg_ok{
+            IndexIsShortReorgAttestedForkChild(m_chainman, tip, root_index)};
+        const bool tip_child_ok{
+            IndexIsFollowedTipChild(m_chainman, tip, root_index)};
+        // Only chase a genuinely actionable root whose body we still lack.
+        // HEADER_ONLY remains authoritative for every unapproved sibling;
+        // signed/quorum-approved short-reorg roots are the narrow exception.
+        if (root_index == nullptr ||
+            (!tip_child_ok && !short_reorg_ok) ||
+            (root_index->nStatus & BLOCK_HAVE_DATA) != 0 ||
+            (root_index->nStatus & BLOCK_FAILED_MASK) != 0 ||
+            IsHeaderOnlyFetchSuppressed(
+                m_chainman, tip, root_index, m_header_only_competing,
+                m_header_only_followed_skip, /*peer_best_known=*/nullptr)) {
+            m_autofetch_root_hash.SetNull();
+            m_autofetch_tried.clear();
+            return;
+        }
+
+        if (m_matmul_block_lifecycle.HasRetainedBody(m_autofetch_root_hash) ||
+            m_matmul_block_lifecycle.ShouldSkipFetchWhileAsyncPending(
+                m_autofetch_root_hash, /*have_data=*/false) ||
+            IsMatMulBudgetDeferred(m_autofetch_root_hash, now)) {
+            return;
+        }
+        if (IsBlockRequested(m_autofetch_root_hash)) {
+            const auto stale_after{
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::seconds{BLOCK_ROOT_BODY_TIP_STUCK_S})};
+            if (!BlockInFlightFullyStale(m_autofetch_root_hash, now,
+                                         stale_after)) {
+                return;
+            }
+            // Do not immediately hand the same request back to a silent
+            // owner. Treat every stale owner as already tried for this
+            // rotation; if no alternative exists, the normal cycle reset
+            // below permits a retry on the following watchdog tick.
+            const auto stale_owners{
+                mapBlocksInFlight.equal_range(m_autofetch_root_hash)};
+            for (auto it = stale_owners.first; it != stale_owners.second;
+                 ++it) {
+                m_autofetch_tried.insert(it->second.first);
+                if (CNodeState* stale_state{State(it->second.first)}) {
+                    stale_state->m_block_download_paused_until = std::max(
+                        stale_state->m_block_download_paused_until,
+                        now + BLOCK_DOWNLOAD_TIMEOUT_REREQUEST_COOLDOWN);
+                }
+            }
+            RemoveBlockRequest(m_autofetch_root_hash, std::nullopt);
+        }
+
+        std::optional<std::tuple<bool, bool, bool, bool, int, NodeId>> best_rank;
         for (const auto& [id, st] : m_node_states) {
-            if (st.m_starting_height <= tip->nHeight) continue;
+            if (now < st.m_block_download_paused_until) continue;
+            if (st.vBlocksInFlight.size() >= MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
+                continue;
+            }
+            const bool gpu_authority{PeerIsGpuAuthority(id, st)};
+            if (!node::matmul_trusted::StalledTowerFetchPeerMayServeBodies(
+                    gpu_authority, st.m_can_serve_blocks,
+                    /*version_handshake_complete=*/st.m_starting_height >= 0,
+                    st.m_manual, st.m_noban)) {
+                continue;
+            }
+            const int best_known_height{
+                st.pindexBestKnownBlock != nullptr
+                    ? st.pindexBestKnownBlock->nHeight
+                    : -1};
+            const int advertised_height{
+                std::max(st.m_starting_height, best_known_height)};
+            const bool exact_ancestry{
+                st.pindexBestKnownBlock != nullptr &&
+                best_known_height >= root_index->nHeight &&
+                st.pindexBestKnownBlock->GetAncestor(root_index->nHeight) ==
+                    root_index};
+            // BestKnown ancestry is proof that the peer announced this branch.
+            // Keep VERSION height as a fallback because getdata-by-hash can
+            // succeed before the peer's BestKnown index is established.
+            if (!exact_ancestry && advertised_height < root_index->nHeight) {
+                continue;
+            }
+            // NODE_NETWORK_LIMITED promises only its recent window. Do not
+            // burn another watchdog interval on a root it is no longer
+            // required to retain; prefer a full NODE_NETWORK archive even
+            // when the limited peer once announced this branch.
+            if (st.m_can_serve_blocks && !st.m_node_network &&
+                advertised_height >= root_index->nHeight &&
+                advertised_height - root_index->nHeight >=
+                    static_cast<int>(MIN_BLOCKS_TO_KEEP)) {
+                continue;
+            }
             ++candidate_count;
             if (m_autofetch_tried.find(id) != m_autofetch_tried.end()) continue;
-            if (st.m_starting_height > best_h) {
-                best_h = st.m_starting_height;
+            const auto rank{std::make_tuple(
+                exact_ancestry, st.m_node_network, st.m_has_served_block,
+                gpu_authority || st.m_manual || st.m_noban,
+                advertised_height, -id)};
+            if (!best_rank || rank > *best_rank) {
+                best_rank = rank;
                 chosen = id;
             }
         }
@@ -3630,11 +3888,11 @@ void PeerManagerImpl::AutoFetchStuckTipRoot()
         root_hash = m_autofetch_root_hash;
         root_height = root_index->nHeight;
     }
-    // FetchBlock re-takes cs_main and m_peer_mutex itself; call it unlocked.
+    // The guarded helper re-takes cs_main itself; call it unlocked.
     const std::optional<std::string> err{
-        FetchBlock(chosen, root_hash, root_index)};
-    LogInfo("Auto-fetch served-body-tip wedge: re-requesting tip-critical body "
-            "%s height=%d from peer=%d (rotation over %zu peers past tip)%s%s\n",
+        FetchActionableRecoveryBlock(chosen, root_hash, root_index)};
+    LogInfo("Auto-fetch actionable recovery root: requesting body %s height=%d "
+            "from peer=%d (rotation over %zu eligible peers)%s%s\n",
             root_hash.ToString(), root_height, chosen, candidate_count,
             err ? " -- " : "", err ? err->c_str() : "");
 }
@@ -6245,20 +6503,19 @@ void PeerManagerImpl::FindNextBlocksToDownload(const Peer& peer, unsigned int co
         if (m_last_root_first_summary.count() == 0 ||
             now_for_diag >= m_last_root_first_summary + BLOCK_ROOT_FIRST_SUMMARY_INTERVAL) {
             m_last_root_first_summary = now_for_diag;
-            // How long has THIS exact tip-critical block been the stuck root?
-            const int64_t now_s{GetTime<std::chrono::seconds>().count()};
+            // The scheduler owns recovery-root age so unrelated peers cannot
+            // reset the timer while this per-peer diagnostic is emitted.
+            const int64_t now_s{
+                std::chrono::duration_cast<std::chrono::seconds>(now_for_diag)
+                    .count()};
             int64_t stuck_for_s{0};
             if (root_first.lowest_missing != nullptr) {
                 const uint256 root_hash{
                     root_first.lowest_missing->GetBlockHash()};
-                if (root_hash != m_stuck_root_hash) {
-                    m_stuck_root_hash = root_hash;
-                    m_stuck_root_since_s = now_s;
+                if (root_hash == m_stuck_root_hash &&
+                    now_s >= m_stuck_root_since_s) {
+                    stuck_for_s = now_s - m_stuck_root_since_s;
                 }
-                stuck_for_s = now_s - m_stuck_root_since_s;
-            } else {
-                m_stuck_root_hash.SetNull();
-                m_stuck_root_since_s = now_s;
             }
             LogInfo("Block download root-first: peer=%d tip=%d last_common=%d "
                     "lowest_missing=%s missing_height=%d select=%s clamp=%s "
@@ -6286,29 +6543,14 @@ void PeerManagerImpl::FindNextBlocksToDownload(const Peer& peer, unsigned int co
             if (stuck_for_s >= BLOCK_ROOT_BODY_TIP_STUCK_S &&
                 root_first.lowest_missing != nullptr) {
                 LogInfo("Convergence note: tip-critical block %s height=%d has "
-                        "been requested for %ds with no delivery -- no connected "
-                        "peer is serving this BODY. The node is at the served "
+                        "lacked a body for %ds -- no connected peer has delivered "
+                        "this BODY. The node is at the served "
                         "body tip (headers ahead may be bodyless competing "
                         "towers), waiting on the network -- NOT an RC/verify/"
                         "connect stall or node fault.\n",
                         root_first.lowest_missing->GetBlockHash().ToString(),
                         root_first.lowest_missing->nHeight,
                         static_cast<int>(stuck_for_s));
-                // Auto-recovery: if the stuck block is the active-chain tip+1,
-                // arm the getdata rotation so the scheduler re-asks peers that
-                // advertise past our tip -- the peers that actually hold the
-                // body (off an advertised competing tower) are invisible to the
-                // per-peer branch-gated selector, so waiting on the one silent
-                // in-flight owner wedges forever without this.
-                if (root_first.lowest_missing->pprev ==
-                    m_chainman.ActiveChain().Tip()) {
-                    const uint256 stuck_hash{
-                        root_first.lowest_missing->GetBlockHash()};
-                    if (m_autofetch_root_hash != stuck_hash) {
-                        m_autofetch_root_hash = stuck_hash;
-                        m_autofetch_tried.clear();
-                    }
-                }
             }
         }
     }

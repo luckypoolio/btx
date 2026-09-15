@@ -3873,9 +3873,9 @@ BOOST_AUTO_TEST_CASE(handoff_peer_budget_miss_retains_tip_child_body)
     peerman.ResetMatMulVerifyAdmissionForTest();
 }
 
-BOOST_AUTO_TEST_CASE(competing_sibling_stays_header_only_on_trusted_mirror)
+BOOST_AUTO_TEST_CASE(competing_sibling_autofetch_waits_for_trusted_quorum)
 {
-    LOCK(NetEventsInterface::g_msgproc_mutex);
+    WAIT_LOCK(NetEventsInterface::g_msgproc_mutex, msgproc_lock);
 
     node::matmul_trusted::ResetForTest();
     ResetSharedPeermanFixture(m_node);
@@ -3931,8 +3931,10 @@ BOOST_AUTO_TEST_CASE(competing_sibling_stays_header_only_on_trusted_mirror)
         ConnmanTestMsg& connman;
         PeerManager& peerman;
         CNode& node;
+        bool active{true};
         ~FinalizePeer()
         {
+            if (!active) return;
             peerman.FinalizeNode(node);
             connman.RemoveTestNode(node);
         }
@@ -3977,11 +3979,18 @@ BOOST_AUTO_TEST_CASE(competing_sibling_stays_header_only_on_trusted_mirror)
     }
     BOOST_CHECK_LT(requests, 20U);
 
-    // Late MMATTEST quorum authenticates the sibling. F3
-    // AdvanceLastCommonPastActiveTip still drops same-height sibling holes
-    // so they cannot occupy inflight (FindLowestMissingBody on a fork is
-    // not a descendant of the connected tip). GETDATA for that body is a
-    // grandchild/descendant path, not this sibling.
+    // The recovery watchdog must not bypass HEADER_ONLY for an ordinary
+    // equal-work sibling before it has signed/quorum authority.
+    connman.FlushSendBuffer(peer);
+    {
+        REVERSE_LOCK(msgproc_lock);
+        peerman.AutoFetchStuckTipRootForTest();
+    }
+    BOOST_CHECK_EQUAL(CountQueuedGetDataForHash(peer, competing_hash), 0U);
+
+    // Late MMATTEST quorum authenticates the sibling. F3 intentionally keeps
+    // dropping the same-height hole from ordinary branch walking; the
+    // actionable-root watchdog below is the narrow recovery path.
     matmul::trusted::ExactReplayStatement statement;
     statement.chain_id = uint256::FromHex(std::string(64, '1')).value();
     statement.block_hash = competing_hash;
@@ -4047,6 +4056,78 @@ BOOST_AUTO_TEST_CASE(competing_sibling_stays_header_only_on_trusted_mirror)
     BOOST_CHECK(!source.fDisconnect);
     BOOST_CHECK(source_stats.vHeightInFlight.empty());
     BOOST_CHECK(!HasQueuedMessageType(source, NetMsgType::GETDATA));
+    connman.FlushSendBuffer(source);
+
+    // Prove this peer can deliver bodies without changing the chain: BLOCK
+    // processing records body availability before discarding a duplicate.
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(
+        source, NetMsg::Make(NetMsgType::BLOCK, TX_WITH_WITNESS(followed))));
+    source.fPauseSend = false;
+    (void)connman.ProcessMessagesOnce(source);
+    connman.FlushSendBuffer(source);
+
+    // A taller VERSION-only peer is not evidence that it has this fork body.
+    // The recovery rotation must prefer the exact, body-proven source above.
+    CNode decoy{/*id=*/222,
+                /*sock=*/nullptr,
+                CAddress{PeermanTestService(0x2200007f), NODE_NETWORK},
+                /*nKeyedNetGroupIn=*/0x24,
+                /*nLocalHostNonceIn=*/0,
+                CAddress{},
+                /*addrNameIn=*/"higher-version-body-decoy",
+                ConnectionType::OUTBOUND_FULL_RELAY,
+                /*inbound_onion=*/false,
+                /*network_key=*/0};
+    connman.Handshake(decoy, /*successfully_connected=*/true, services,
+                      services, PROTOCOL_VERSION, /*relay_txs=*/true,
+                      /*starting_height=*/tip->nHeight + 100);
+    connman.AddTestNode(decoy);
+    connman.FlushSendBuffer(decoy);
+    struct FinalizeDecoy {
+        ConnmanTestMsg& connman;
+        PeerManager& peerman;
+        CNode& node;
+        ~FinalizeDecoy()
+        {
+            peerman.FinalizeNode(node);
+            connman.RemoveTestNode(node);
+        }
+    } finalize_decoy{connman, peerman, decoy};
+
+    // Normal branch walking still refuses the same-height sibling. The
+    // watchdog is the narrow recovery path that may fetch it after quorum.
+    // Remove the original attestation peer so this assertion isolates exact
+    // ancestry/body evidence against the taller VERSION-only decoy.
+    peerman.FinalizeNode(peer);
+    connman.RemoveTestNode(peer);
+    finalize.active = false;
+    connman.FlushSendBuffer(source);
+    connman.FlushSendBuffer(decoy);
+    {
+        REVERSE_LOCK(msgproc_lock);
+        peerman.AutoFetchStuckTipRootForTest();
+    }
+
+    CNodeStateStats recovered_source_stats;
+    CNodeStateStats decoy_stats;
+    BOOST_REQUIRE(peerman.GetNodeStateStats(source.GetId(),
+                                            recovered_source_stats));
+    BOOST_REQUIRE(peerman.GetNodeStateStats(decoy.GetId(), decoy_stats));
+    BOOST_CHECK(std::ranges::find(recovered_source_stats.vHeightInFlight,
+                                  tip->nHeight + 1) !=
+                recovered_source_stats.vHeightInFlight.end());
+    BOOST_CHECK(peerman.IsBlockRequestedFromPeerForTest(
+        competing_hash, source.GetId()));
+    BOOST_CHECK(decoy_stats.vHeightInFlight.empty());
+    BOOST_CHECK(!peerman.IsBlockRequestedFromPeerForTest(
+        competing_hash, decoy.GetId()));
+    {
+        LOCK(::cs_main);
+        const CBlockIndex* competing_idx{
+            m_node.chainman->m_blockman.LookupBlockIndex(competing_hash)};
+        BOOST_REQUIRE(competing_idx != nullptr);
+        BOOST_CHECK_EQUAL(competing_idx->nStatus & BLOCK_HAVE_DATA, 0);
+    }
 
     {
         LOCK(::cs_main);
@@ -9751,6 +9832,169 @@ BOOST_AUTO_TEST_CASE(recalculate_best_header_runs_when_unconfigured)
         BOOST_REQUIRE(chainman.m_best_header != nullptr);
         BOOST_CHECK_GE(chainman.m_best_header->nHeight, tip->nHeight);
     });
+}
+
+BOOST_AUTO_TEST_CASE(autofetch_one_header_tip_child_rotates_stale_owner)
+{
+    WAIT_LOCK(NetEventsInterface::g_msgproc_mutex, msgproc_lock);
+    node::matmul_trusted::ResetForTest();
+    ResetSharedPeermanFixture(m_node);
+    ChainstateManager& chainman{*Assert(m_node.chainman)};
+    PeerManager& peerman{*Assert(m_node.peerman)};
+    ConnmanTestMsg& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    const CBlockIndex* const starting_tip{
+        WITH_LOCK(::cs_main, return chainman.ActiveChain().Tip())};
+    BOOST_REQUIRE(starting_tip != nullptr);
+    SetMockTime(std::chrono::seconds{starting_tip->GetBlockTime() + 3600});
+    BOOST_REQUIRE(!chainman.IsInitialBlockDownload());
+
+    CBlock child = node::BlockAssembler{
+        chainman.ActiveChainstate(), nullptr, {}, m_node}
+                       .CreateNewBlock()
+                       ->block;
+    child.hashMerkleRoot = BlockMerkleRoot(child);
+    BOOST_REQUIRE(MineHeaderForConsensus(
+        child, static_cast<uint32_t>(starting_tip->nHeight + 1),
+        chainman.GetConsensus(), 5'000'000,
+        starting_tip->GetMedianTimePast()));
+    child.fChecked = true;
+    BlockValidationState header_state;
+    BOOST_REQUIRE_MESSAGE(
+        chainman.ProcessNewBlockHeaders(
+            {{child.GetBlockHeader()}}, /*min_pow_checked=*/true, header_state),
+        header_state.ToString());
+    const uint256 child_hash{child.GetHash()};
+    BOOST_REQUIRE_EQUAL(
+        WITH_LOCK(::cs_main, return chainman.m_best_header->GetBlockHash()),
+        child_hash);
+
+    // Keep 16 distinct known indexes only to fill one peer's normal per-peer
+    // download window. Reset best-header to the single actionable child so
+    // this remains the one-header tip-stall regression.
+    CBlockIndex* const child_index{WITH_LOCK(
+        ::cs_main, return chainman.m_blockman.LookupBlockIndex(child_hash))};
+    BOOST_REQUIRE(child_index != nullptr);
+    std::vector<CBlockIndex*> saturation_headers;
+    const CBlockIndex* saturation_walk{child_index};
+    for (unsigned int tag = 0x70; tag < 0x80; ++tag) {
+        saturation_walk =
+            MakePeermanHeaderChild(chainman, *saturation_walk, tag);
+        saturation_headers.push_back(const_cast<CBlockIndex*>(saturation_walk));
+    }
+    BOOST_REQUIRE_EQUAL(saturation_headers.size(), 16U);
+    WITH_LOCK(::cs_main, {
+        chainman.SetBestHeader(child_index);
+        chainman.m_best_claimed_header = child_index;
+    });
+
+    const ServiceFlags services{ServiceFlags(NODE_NETWORK | NODE_WITNESS)};
+    CNode saturated{/*id=*/5415, /*sock=*/nullptr, CAddress{},
+                    /*nKeyedNetGroupIn=*/5415, /*nLocalHostNonceIn=*/0,
+                    CAddress{}, /*addrNameIn=*/"autofetch-one-header-saturated",
+                    ConnectionType::OUTBOUND_FULL_RELAY,
+                    /*inbound_onion=*/false, /*network_key=*/0};
+    CNode silent{/*id=*/5416, /*sock=*/nullptr, CAddress{},
+                 /*nKeyedNetGroupIn=*/5416, /*nLocalHostNonceIn=*/0,
+                 CAddress{}, /*addrNameIn=*/"autofetch-one-header-silent",
+                 ConnectionType::OUTBOUND_FULL_RELAY,
+                 /*inbound_onion=*/false, /*network_key=*/0};
+    CNode other{/*id=*/5417, /*sock=*/nullptr, CAddress{},
+                /*nKeyedNetGroupIn=*/5417, /*nLocalHostNonceIn=*/0,
+                CAddress{}, /*addrNameIn=*/"autofetch-one-header-other",
+                ConnectionType::OUTBOUND_FULL_RELAY,
+                /*inbound_onion=*/false, /*network_key=*/0};
+    connman.Handshake(saturated, /*successfully_connected=*/true, services,
+                      services, PROTOCOL_VERSION, /*relay_txs=*/true);
+    connman.Handshake(silent, /*successfully_connected=*/true, services,
+                      services, PROTOCOL_VERSION, /*relay_txs=*/true);
+    connman.Handshake(other, /*successfully_connected=*/true, services,
+                      services, PROTOCOL_VERSION, /*relay_txs=*/true);
+    connman.AddTestNode(saturated);
+    connman.AddTestNode(silent);
+    connman.AddTestNode(other);
+    struct Cleanup {
+        ChainstateManager& chainman;
+        PeerManager& peerman;
+        ConnmanTestMsg& connman;
+        CNode& saturated;
+        CNode& silent;
+        CNode& other;
+        ~Cleanup()
+        {
+            peerman.FinalizeNode(saturated);
+            peerman.FinalizeNode(silent);
+            peerman.FinalizeNode(other);
+            connman.RemoveTestNode(saturated);
+            connman.RemoveTestNode(silent);
+            connman.RemoveTestNode(other);
+            NeutralizeUnconnectedHeaders(chainman);
+            peerman.ResetMatMulVerifyAdmissionForTest();
+        }
+    } cleanup{chainman, peerman, connman, saturated, silent, other};
+
+    auto advertise = [&](CNode& peer) {
+        connman.FlushSendBuffer(peer);
+        std::vector<CBlock> headers{CBlock{child.GetBlockHeader()}};
+        BOOST_REQUIRE(connman.ReceiveMsgFrom(
+            peer, NetMsg::Make(NetMsgType::HEADERS,
+                               TX_WITH_WITNESS(headers))));
+        peer.fPauseSend = false;
+        (void)connman.ProcessMessagesOnce(peer);
+    };
+    advertise(silent);
+
+    silent.fPauseSend = false;
+    BOOST_CHECK(peerman.SendMessages(&silent));
+    CNodeStateStats silent_initial;
+    BOOST_REQUIRE(peerman.GetNodeStateStats(silent.GetId(), silent_initial));
+    BOOST_REQUIRE_EQUAL(silent_initial.vHeightInFlight.size(), 1U);
+    BOOST_CHECK_EQUAL(silent_initial.vHeightInFlight.front(),
+                      starting_tip->nHeight + 1);
+    connman.FlushSendBuffer(silent);
+
+    // Only expose the alternatives after the silent peer owns the child, so
+    // ordinary direct-fetch cannot assign the root to either of them first.
+    advertise(saturated);
+    advertise(other);
+    for (const CBlockIndex* index : saturation_headers) {
+        BOOST_REQUIRE(!peerman.FetchBlock(saturated.GetId(), *index));
+    }
+    CNodeStateStats saturated_initial;
+    BOOST_REQUIRE(peerman.GetNodeStateStats(saturated.GetId(),
+                                            saturated_initial));
+    BOOST_REQUIRE_EQUAL(saturated_initial.vHeightInFlight.size(), 16U);
+    connman.FlushSendBuffer(saturated);
+
+    // First pass starts the watchdog timer. The request is still fresh, so it
+    // must remain with the original owner.
+    {
+        REVERSE_LOCK(msgproc_lock);
+        peerman.AutoFetchStuckTipRootForTest();
+    }
+    SetMockTime(std::chrono::seconds{GetTime() + 121});
+    connman.FlushSendBuffer(other);
+    {
+        REVERSE_LOCK(msgproc_lock);
+        peerman.AutoFetchStuckTipRootForTest();
+    }
+
+    CNodeStateStats silent_after;
+    CNodeStateStats other_after;
+    CNodeStateStats saturated_after;
+    BOOST_REQUIRE(peerman.GetNodeStateStats(saturated.GetId(), saturated_after));
+    BOOST_REQUIRE(peerman.GetNodeStateStats(silent.GetId(), silent_after));
+    BOOST_REQUIRE(peerman.GetNodeStateStats(other.GetId(), other_after));
+    BOOST_CHECK(silent_after.vHeightInFlight.empty());
+    BOOST_REQUIRE_EQUAL(other_after.vHeightInFlight.size(), 1U);
+    BOOST_CHECK_EQUAL(other_after.vHeightInFlight.front(),
+                      starting_tip->nHeight + 1);
+    BOOST_CHECK(peerman.IsBlockRequestedFromPeerForTest(
+        child_hash, other.GetId()));
+    BOOST_CHECK(!peerman.IsBlockRequestedFromPeerForTest(
+        child_hash, silent.GetId()));
+    BOOST_CHECK_EQUAL(saturated_after.vHeightInFlight.size(), 16U);
+    BOOST_CHECK(!peerman.IsBlockRequestedFromPeerForTest(
+        child_hash, saturated.GetId()));
 }
 
 BOOST_AUTO_TEST_CASE(silent_getdata_peer_rerequested_from_other_and_tip_advances)

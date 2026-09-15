@@ -406,6 +406,13 @@ public:
      *  Production calls this from CScheduler, never from SendMessages
      *  (g_msgproc_mutex). Tests must not hold that mutex. */
     virtual void RetryMatMulDeferredBodiesForTest() = 0;
+    /** Drive the production actionable-root GETDATA watchdog without waiting
+     *  for its scheduler interval. */
+    virtual void AutoFetchStuckTipRootForTest() = 0;
+    /** Inspect exact watchdog request ownership without relying on an
+     *  optimistic socket write leaving GETDATA in CNode::vSendMsg. */
+    virtual bool IsBlockRequestedFromPeerForTest(
+        const uint256& hash, NodeId peer_id) = 0;
     /** Issue 116: mint via PersistMatMulExactReplayVerdict (header-first /
      *  historical ExactReplay) and gossip MMATTEST without ProcessBlockSync.
      *  Only pushes a signature this process just produced. */
