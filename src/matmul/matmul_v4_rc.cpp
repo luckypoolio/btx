@@ -878,10 +878,24 @@ Phase1Result Phase1AssociativeRecall(const uint256& seed_r, const uint256& sigma
         return out;
     }
 
-    for (uint32_t i = 0; i < p.n_q; ++i) {
-        if (ExactReplayCancellationRequested()) {
-            out.ok = false;
-            return out;
+    const std::atomic_bool* const replay_cancelled =
+        g_exact_replay_cancelled;
+    const std::atomic_bool* const replay_secondary_cancelled =
+        g_exact_replay_secondary_cancelled;
+    const auto cancellation_requested = [&]() {
+        return (replay_cancelled != nullptr &&
+                replay_cancelled->load(std::memory_order_relaxed)) ||
+               (replay_secondary_cancelled != nullptr &&
+                replay_secondary_cancelled->load(
+                    std::memory_order_relaxed));
+    };
+    std::atomic_bool query_cancelled{false};
+    const auto process_query = [&](size_t query_index) {
+        const uint32_t i = static_cast<uint32_t>(query_index);
+        if (query_cancelled.load(std::memory_order_relaxed) ||
+            cancellation_requested()) {
+            query_cancelled.store(true, std::memory_order_relaxed);
+            return;
         }
         int64_t pending_raw[kRCMxBlockLen];
         uint32_t pending_fill = 0;
@@ -954,6 +968,10 @@ Phase1Result Phase1AssociativeRecall(const uint256& seed_r, const uint256& sigma
         for (uint32_t t0 = 0; t0 < p.n_ctx; t0 += delta) {
             const uint32_t t1 = std::min(t0 + delta, p.n_ctx);
             for (uint32_t t = t0; t < t1; ++t) {
+                if ((t & 0x3fffU) == 0 && cancellation_requested()) {
+                    query_cancelled.store(true, std::memory_order_relaxed);
+                    return;
+                }
                 int64_t acc = 0;
                 for (uint32_t d = 0; d < p.d_head; ++d) {
                     acc += static_cast<int64_t>(Q[static_cast<size_t>(i) * p.d_head + d]) *
@@ -1000,6 +1018,21 @@ Phase1Result Phase1AssociativeRecall(const uint256& seed_r, const uint256& sigma
                 .prf_key = prf_Z,
             });
         }
+    };
+
+    constexpr uint64_t kParallelPhase1MinMacs{16ull * 1024 * 1024};
+    constexpr uint32_t kParallelPhase1MaxWorkers{32};
+    const uint64_t phase1_macs =
+        2ull * p.n_q * p.n_ctx * p.d_head;
+    const uint32_t hardware_threads =
+        std::max(std::thread::hardware_concurrency(), 1U);
+    const uint32_t query_threads =
+        proof_sink == nullptr && phase1_macs >= kParallelPhase1MinMacs
+        ? std::min(hardware_threads, kParallelPhase1MaxWorkers)
+        : 1U;
+    ParallelForLocal(p.n_q, query_threads, process_query);
+    if (query_cancelled.load(std::memory_order_relaxed)) {
+        out.ok = false;
     }
     return out;
 }

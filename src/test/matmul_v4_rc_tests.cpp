@@ -2262,6 +2262,25 @@ BOOST_AUTO_TEST_CASE(rc_cpu_portable_and_device_oracle_share_header_digest)
     BOOST_CHECK_EQUAL(accelerated.cpu_gemm_calls, 0U);
 }
 
+BOOST_AUTO_TEST_CASE(rc_parallel_cpu_phase1_matches_exactgemm_oracle)
+{
+    const auto header{MakeRCHeader(0x504152414c4c454c)};
+    auto params{rc::MakeToyRCEpisodeParams()};
+    params.n_ctx = 8192;
+
+    const uint256 parallel_cpu{
+        rc::RecomputeResidentCurriculumReference(header, params, 0)};
+    BOOST_REQUIRE(!parallel_cpu.IsNull());
+
+    lt::ExactGemmBackend oracle;
+    oracle.gemm_s8s8 = &OracleGemmS8S8;
+    const uint256 exactgemm{
+        rc::RecomputeResidentCurriculumReference(
+            header, params, 0, {}, nullptr, nullptr, oracle)};
+    BOOST_REQUIRE(!exactgemm.IsNull());
+    BOOST_CHECK_EQUAL(parallel_cpu, exactgemm);
+}
+
 BOOST_AUTO_TEST_CASE(rc_strict_faulty_device_cpu_recovers_honest_header)
 {
     rc::ClearRCExactReplayAlternateProviders();
