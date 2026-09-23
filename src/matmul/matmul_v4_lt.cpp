@@ -24,6 +24,7 @@
 #include <limits>
 #include <cstring>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -504,6 +505,43 @@ uint64_t AccelReplicaMatExpandPrfLE64(const uint32_t key[8], int32_t raw, uint32
     return static_cast<uint64_t>(x0) | (static_cast<uint64_t>(x1) << 32);
 }
 
+template <typename Fn>
+void ForEachExactGemmRow(uint32_t rows, uint32_t inner, uint32_t cols, Fn&& fn)
+{
+    constexpr uint64_t PARALLEL_MIN_MACS{16ull * 1024 * 1024};
+    constexpr uint32_t MAX_WORKERS{32};
+    const uint64_t macs = static_cast<uint64_t>(rows) * inner * cols;
+    const uint32_t hardware_threads = std::thread::hardware_concurrency();
+    const uint32_t workers = macs >= PARALLEL_MIN_MACS
+        ? std::min({rows, std::max(hardware_threads, 1U), MAX_WORKERS})
+        : 1U;
+    if (workers <= 1) {
+        for (uint32_t i = 0; i < rows; ++i) fn(i);
+        return;
+    }
+
+    const uint32_t rows_per_worker = (rows + workers - 1) / workers;
+    std::vector<std::thread> threads;
+    threads.reserve(workers - 1);
+    try {
+        for (uint32_t worker = 1; worker < workers; ++worker) {
+            const uint32_t begin = worker * rows_per_worker;
+            const uint32_t end = std::min(rows, begin + rows_per_worker);
+            if (begin >= end) break;
+            threads.emplace_back([begin, end, &fn] {
+                for (uint32_t i = begin; i < end; ++i) fn(i);
+            });
+        }
+    } catch (...) {
+        for (std::thread& thread : threads) thread.join();
+        throw;
+    }
+
+    const uint32_t first_end = std::min(rows, rows_per_worker);
+    for (uint32_t i = 0; i < first_end; ++i) fn(i);
+    for (std::thread& thread : threads) thread.join();
+}
+
 } // namespace
 
 uint64_t MatExpandPrfLaneLE64(const uint256& prf_key, int32_t raw, uint32_t i, uint32_t j,
@@ -529,7 +567,7 @@ std::vector<int32_t> ExactGemmS8S8(const std::vector<int8_t>& L, const std::vect
 {
     // Exact s8xs8->s32: |L|,|R| <= 48, so every accumulator is exact in int32.
     std::vector<int32_t> out(static_cast<size_t>(rows) * cols, 0);
-    for (uint32_t i = 0; i < rows; ++i) {
+    ForEachExactGemmRow(rows, inner, cols, [&](uint32_t i) {
         const int8_t* l_row = &L[static_cast<size_t>(i) * inner];
         int32_t* o_row = &out[static_cast<size_t>(i) * cols];
         for (uint32_t k = 0; k < inner; ++k) {
@@ -540,7 +578,7 @@ std::vector<int32_t> ExactGemmS8S8(const std::vector<int8_t>& L, const std::vect
                 o_row[c] += l_ik * static_cast<int32_t>(r_row[c]);
             }
         }
-    }
+    });
     return out;
 }
 

@@ -1396,6 +1396,36 @@ BOOST_AUTO_TEST_CASE(exact_gemm_s32s8_radix256_matches_cpu)
     BOOST_CHECK(lowered.empty());
 }
 
+BOOST_AUTO_TEST_CASE(exact_gemm_s8s8_parallel_rows_match_scalar)
+{
+    constexpr uint32_t rows{32};
+    constexpr uint32_t inner{1024};
+    constexpr uint32_t cols{512};
+    std::vector<int8_t> lhs(static_cast<size_t>(rows) * inner);
+    std::vector<int8_t> rhs(static_cast<size_t>(inner) * cols);
+    for (size_t i = 0; i < lhs.size(); ++i) {
+        lhs[i] = static_cast<int8_t>(static_cast<int>(i % 97) - 48);
+    }
+    for (size_t i = 0; i < rhs.size(); ++i) {
+        rhs[i] = static_cast<int8_t>(static_cast<int>((i * 7) % 97) - 48);
+    }
+
+    const std::vector<int32_t> actual{
+        lt::ExactGemmS8S8(lhs, rhs, rows, inner, cols)};
+    std::vector<int32_t> expected(static_cast<size_t>(rows) * cols, 0);
+    for (uint32_t row = 0; row < rows; ++row) {
+        for (uint32_t k = 0; k < inner; ++k) {
+            const int32_t left = lhs[static_cast<size_t>(row) * inner + k];
+            for (uint32_t col = 0; col < cols; ++col) {
+                expected[static_cast<size_t>(row) * cols + col] +=
+                    left * static_cast<int32_t>(rhs[static_cast<size_t>(k) * cols + col]);
+            }
+        }
+    }
+    BOOST_CHECK_EQUAL_COLLECTIONS(
+        actual.begin(), actual.end(), expected.begin(), expected.end());
+}
+
 BOOST_AUTO_TEST_CASE(exact_gemm_backend_mock_matches_cpu)
 {
     // Injectable backend that wraps ExactGemm* must be byte-identical to the
